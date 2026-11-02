@@ -176,3 +176,23 @@ Installations must verify that their Codex host consumes queued messages and
 starts idle chats. Unsupported hosts leave an explicit unacknowledged receipt;
 Monohero never substitutes a new session. Automatic Claude resumption is outside
 this release. See [agent instructions](integrations/AGENT.md).
+
+
+## Explicit goal waiting (0.3)
+
+An active Codex goal may continue scheduling turns while its release waits.
+When the user explicitly asks to pause that goal during queue waiting, use:
+
+```sh
+monohero enqueue --queue my-project-release --key task-43 \
+  --thread "$CODEX_THREAD_ID" --park-goal \
+  --message "Continue the authorized release."
+```
+
+The existing goal is paused, then restored after the grant message is queued.
+Its objective, budget and accumulated usage are preserved. The destination still
+claims and finishes its slot. Changed goals are never intentionally overwritten;
+uncertain lifecycle changes stop for inspection. A cancelled/failed job leaves
+its goal paused until explicit `unpark-goal`. Without this opt-in, goals are
+unchanged and may continue independent work. See [goal lifecycle and recovery](integrations/AGENT.md#existing-goals-while-waiting), including host timestamp
+requirements and the public API's lack of atomic compare-and-set revisions.
