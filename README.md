@@ -96,7 +96,8 @@ The same instruction is available locally with `monohero guide`. See the complet
 [agent integration guide](integrations/AGENT.md), plus
 [Codex and Claude examples](docs/agents.md).
 
-**Monohero runs commands, not conversations.** It does not wake arbitrary UI chats.
+Command mode runs executable workflows. For existing Codex conversations, use the
+explicit enqueue/finish and notify modes described below. It does not wake arbitrary UI chats.
 For quiet operation submit a complete workflow and end the turn. A host may attach
 one blocking `wait` if it supports completion events without model polling.
 An explicitly configured `--on-complete /absolute/executable` can notify a user or
@@ -142,3 +143,36 @@ cargo build --release --locked
 Black-box tests cover FIFO, parallel queues, deduplication, blocking wait,
 failure barriers, cancellation, persistence, surviving children and callbacks.
 See [the design](docs/specs/2026-11-02-monohero.md). MIT licensed.
+
+## Resume an existing Codex chat (0.2)
+
+Queue the chat itself instead of preparing a shell workflow:
+
+```sh
+monohero enqueue --queue my-project-release --key task-42 \
+  --thread "$CODEX_THREAD_ID" --message "Continue the authorized release."
+```
+
+End the turn after submission. On grant, Monohero sends a message through the
+Codex CLI's `queue --thread UUID --message TEXT`. The Codex host continues the
+same conversation. No separate CLI agent, new chat or coordinator model is started.
+
+The destination executes `monohero claim JOB_ID --thread UUID`, performs all
+protected work, then `monohero finish JOB_ID --thread UUID`. A queued message is
+only transport acceptance: the claim is confirmation that the chat resumed.
+There is no automatic expiry. Wrong-thread claims/finishes are rejected. Missing
+claims remain visibly unacknowledged instead of pretending delivery succeeded.
+No protected work is allowed after finish. Grants to the same thread are also
+serialized across independent project queues.
+
+`monohero notify JOB_ID --thread UUID` independently waits for a command job and
+messages its owner on completion. The destination runs the supplied `acknowledge`
+command, inspects evidence and continues authorized follow-up. A notice grants no
+release slot. These commands work with a running 0.1.1 service through the stable
+command protocol; active jobs need not be killed or restarted. Keep versioned
+worker executables available unchanged while queued jobs reference them.
+
+Installations must verify that their Codex host consumes queued messages and
+starts idle chats. Unsupported hosts leave an explicit unacknowledged receipt;
+Monohero never substitutes a new session. Automatic Claude resumption is outside
+this release. See [agent instructions](integrations/AGENT.md).

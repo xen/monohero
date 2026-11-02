@@ -1,62 +1,92 @@
 # Integrate Monohero into Codex or Claude Code
 
-Read this instruction, then adapt the project's AGENTS.md (Codex) or CLAUDE.md
-(Claude Code). Preserve existing rules. Ask the owner to choose the queue name
-and the authorized workflow if these are not already explicit. Do not install
-hooks, send messages, change deployment policy, or launch releases implicitly.
+Preserve project instructions, release approvals and checks. Choose one shared
+queue name per exclusive resource; all worktrees use the same Monohero home.
+Separate projects can use separate queues. Sending to a specific chat requires
+the human owner's authorization. Install Monohero and run one explicitly
+configured `monohero serve` under a user service.
 
-## Project configuration to establish
+## Codex: resume this chat when its turn comes
 
-- Monohero executable on PATH (install: `cargo install --git https://github.com/xen/monohero --locked`).
-- One explicitly started `monohero serve` per user, supervised by launchd/systemd
-  or kept in a terminal. All worktrees use the same MONOHERO_HOME.
-- An explicit queue name, e.g. `my-project-release` or `another-project-release`. Worktrees
-  of the same project MUST share it. Different projects can use separate queues;
-  projects sharing an exclusive resource can deliberately share one queue.
-- `--cwd` is the working directory of an individual job, not the queue identity.
-  Omit it to capture the directory from which submit runs. Different worktrees
-  submit with the same queue name and distinct job keys; each command runs in
-  its own captured directory. Keep queued worktrees unchanged until completion.
-- An executable project workflow that completes the authorized operation and
-  exits. It must stop on errors, propagate exit codes, and never detach protected
-  work. Keep sync, checks, review, merge and deploy inside the same job when the
-  project requires all of them to be exclusive. Never bypass approvals.
+Requires a Codex CLI with `queue --thread UUID --message TEXT` and the Codex
+host's queued-message consumption enabled. Register the EXACT existing local
+thread UUID, never a name, --last, a fork or a new session. CODEX_THREAD_ID
+identifies the current chat in Codex. Submit ONCE:
 
-## Rule to add to the project
+```sh
+monohero enqueue --queue my-project-release --key UNIQUE-RELEASE-ID \
+  --thread "$CODEX_THREAD_ID" --message "Continue the authorized release and cleanup."
+```
 
-After explicit release authorization, prepare the release workflow, then submit
-it ONCE with `monohero submit --queue PROJECT-release --key UNIQUE-RELEASE-ID --cwd
-ABSOLUTE-WORKTREE -- /absolute/path/to/workflow`. Read the returned job ID and
-end the turn, reporting only that it is queued. Do not run release checks before
-the queue starts them. Do not poll status, tail progress, exchange coordinator
-messages, or report percentages. Repeating the same submission key is safe only
-with identical inputs. A new follow-up operation uses a new key and joins the tail.
+After the returned job ID, END THE TURN. Do not poll status, report percentages,
+or exchange coordinator messages. `--cwd` is optional: it captures the current
+worktree for that job, not a separate queue. Worktrees of one project use the
+same queue and different keys. Keep queued worktrees available and unchanged.
 
-The daemon executes the workflow even after this chat closes. It does not invoke
-an LLM or consume model tokens. In a client that supports a genuinely blocking
-background completion event, use `monohero wait ID` once and let the host deliver
-the result; do not repeatedly poll the tool session. If the host requires polling,
-end the turn and let the user resume later, or configure an explicitly approved
-`--on-complete /absolute/executable` notification callback. That executable receives
-JOB_ID and STATE as separate arguments. It is an ordinary local executable, NOT
-an automatic instruction or message injection into any chat.
+On grant, Monohero sends a user-visible message to that exact chat through
+`codex queue`. The host resumes its existing conversation and permission/model
+settings; no extra CLI agent or private desktop API is started. Delivery acceptance
+alone is NOT proof the chat resumed. The actual destination must first execute:
 
-For an interactive workflow, the executable may launch a separately authorized
-Codex/Claude CLI process with the task instructions. This costs tokens only when
-that process runs; it does not resume the original UI chat. The executable must
-wait for the whole operation to finish, not spawn a detached agent. Do not launch
-a nested agent without owner authorization. A workflow that requires manual
-judgment may stop as failed; inspect it and explicitly resolve the queue barrier.
+```sh
+monohero claim JOB_ID --thread "$CODEX_THREAD_ID"
+```
 
-When resumed by the user, inspect `monohero status --queue PROJECT-release` once
-and read the completed job log. Failed/interrupted jobs block their queue. Inspect
-external effects and surviving processes BEFORE `monohero resolve ID`. Resolve
-acknowledges inspection, never retries. Submit subsequent work with a new key.
-Queued jobs can be cancelled with `monohero cancel ID`; running jobs cannot.
+The grant prompt includes the exact executable and arguments. If claim fails,
+STOP without performing protected work. After claim, hold the slot through all
+protected sync/check/review/merge/deploy/verification work, including corrections.
+After ALL authorized work is complete, execute:
 
-## Limits to state honestly
+```sh
+monohero finish JOB_ID --thread "$CODEX_THREAD_ID"
+```
 
-Monohero serializes executable workflows. It cannot force unrelated commands or
-other machines into its queue, guarantee zero tokens in a polling host, or wake
-an arbitrary Codex/Claude chat. It does not turn a half-written release script
-into a complete deployment system. The project supplies that workflow.
+On failure/blocker append `--failed` and explain. Do not finish merely to
+acknowledge the grant. Do not enqueue recursively into your own queue. Do no
+protected work after finish; only the final user report remains. The worker
+holds the slot until explicit matching finish. No timer expires it behind the
+chat's back. Monohero serializes its grants to the same thread across queues.
+
+## Existing command workflows: resume their owner on completion
+
+Submit the COMPLETE executable workflow, then register its exact owner:
+
+```sh
+monohero submit --queue my-project-release --key UNIQUE-RELEASE-ID -- ./release.sh
+monohero notify JOB_ID --thread "$CODEX_THREAD_ID"
+```
+
+Then end the turn. An independent observer blocks on completion without polling
+and sends the same chat the actual terminal result. The notification supplies:
+
+```sh
+monohero acknowledge NOTIFICATION_JOB_ID --thread "$CODEX_THREAD_ID"
+```
+
+Execute it to confirm actual receipt, then inspect the saved evidence and report
+the result. A notice grants NO release slot; new protected work must rejoin its
+project queue. Observers never occupy the release queue they wait on.
+
+## Verification and recovery
+
+`monohero status --queue NAME` reads one snapshot. Private ID.log files contain
+execution logs. HOME/chats/JOB_ID.json records message_queued, claimed and completed
+separately, with message ID and timestamps. A chat that never claims its grant
+keeps the slot; a notice that is never acknowledged remains pending. Verify a
+real idle-chat wakeup when installing on a new Codex host. Never label an accepted
+CLI message as confirmed resumption. Unsupported hosts fail or remain visibly
+unacknowledged; no silent replacement session or alternate transport is used.
+
+Failed/interrupted jobs stop their queue. Inspect external effects, the owner's
+actual chat and surviving processes before `monohero resolve JOB_ID`. Resolve
+acknowledges inspection, never retries. New work gets a new key and joins the
+tail. `monohero cancel JOB_ID` cancels queued jobs only. Never retry uncertain
+message delivery blindly. Choose an explicit CLI with `--codex /absolute/path`.
+
+## Claude Code and limits
+
+Command workflow mode remains available to Claude Code. Automatic Claude chat
+resumption is not implemented. Monohero serializes cooperating work on one local
+host; commands outside it are not protected. Waiting/dispatch use no LLM; the
+resumed destination chat consumes tokens for its authorized work. No hooks,
+permission bypasses, new sessions or coordinator agents are installed implicitly.

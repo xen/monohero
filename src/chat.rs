@@ -1,0 +1,476 @@
+//! Event-driven chat handoff on the stable command/wait daemon protocol.
+use super::{call, name, Request};
+use anyhow::{bail, Context, Result};
+use clap::Subcommand;
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{
+    fs::{self, OpenOptions},
+    io::{BufRead, BufReader, Write},
+    os::unix::{
+        fs::{OpenOptionsExt, PermissionsExt},
+        net::{UnixListener, UnixStream},
+    },
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+#[derive(Subcommand)]
+pub enum Actions {
+    /// Queue an authorized existing chat; send a message when its slot is granted.
+    Enqueue {
+        #[arg(long)]
+        queue: String,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        thread: String,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(long, default_value = "codex")]
+        codex: PathBuf,
+        #[arg(long, default_value = "Continue the previously authorized task.")]
+        message: String,
+    },
+    /// Confirm in the destination chat that it received its queue grant.
+    Claim {
+        id: i64,
+        #[arg(long)]
+        thread: String,
+    },
+    /// Finish all protected work and release the chat's slot.
+    Finish {
+        id: i64,
+        #[arg(long)]
+        thread: String,
+        #[arg(long)]
+        failed: bool,
+    },
+    /// Confirm delivery of a completion notice; this does not grant a release slot.
+    Acknowledge {
+        id: i64,
+        #[arg(long)]
+        thread: String,
+    },
+    /// Message a command job's authorized owner when that job becomes terminal.
+    Notify {
+        id: i64,
+        #[arg(long)]
+        thread: String,
+        #[arg(long, default_value = "codex")]
+        codex: PathBuf,
+    },
+    #[command(hide = true)]
+    ChatWorker {
+        #[arg(long)]
+        queue: String,
+        #[arg(long)]
+        key: String,
+        #[arg(long)]
+        thread: String,
+        #[arg(long)]
+        codex: PathBuf,
+        #[arg(long)]
+        message: String,
+    },
+    #[command(hide = true)]
+    NotifyWorker {
+        id: i64,
+        #[arg(long)]
+        thread: String,
+        #[arg(long)]
+        codex: PathBuf,
+    },
+}
+#[derive(Serialize, Deserialize)]
+struct Receipt {
+    job_id: i64,
+    thread_id: String,
+    kind: String,
+    state: String,
+    message_id: Option<String>,
+    claimed_at: Option<u64>,
+    updated_at: u64,
+    finish_requested: Option<bool>,
+    error: Option<String>,
+}
+fn now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+fn validate_thread(id: &str) -> Result<()> {
+    if id.len() != 36
+        || !id.bytes().enumerate().all(|(i, b)| {
+            if [8, 13, 18, 23].contains(&i) {
+                b == b'-'
+            } else {
+                b.is_ascii_hexdigit() && !b.is_ascii_uppercase()
+            }
+        })
+    {
+        bail!("use an exact canonical lowercase Codex thread UUID, not a name or --last");
+    }
+    Ok(())
+}
+fn text(path: &Path) -> Result<String> {
+    Ok(path.to_str().context("non UTF-8 path")?.to_owned())
+}
+fn executable(path: &Path) -> Result<PathBuf> {
+    let found = if path.components().count() > 1 || path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::split_paths(&std::env::var_os("PATH").context("PATH is unset")?)
+            .map(|dir| dir.join(path))
+            .find(|p| p.is_file())
+            .context("Codex executable not found on PATH")?
+    };
+    let found = fs::canonicalize(found)?;
+    if !found.is_file() || fs::metadata(&found)?.permissions().mode() & 0o111 == 0 {
+        bail!("Codex path is not an executable file");
+    }
+    Ok(found)
+}
+fn private_dir(home: &Path) -> Result<PathBuf> {
+    let p = home.join("chats");
+    fs::create_dir_all(&p)?;
+    fs::set_permissions(&p, fs::Permissions::from_mode(0o700))?;
+    Ok(p)
+}
+fn persist(path: &Path, r: &mut Receipt) -> Result<()> {
+    r.updated_at = now();
+    let tmp = path.with_extension("json.tmp");
+    let mut f = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    serde_json::to_writer_pretty(&mut f, r)?;
+    f.sync_all()?;
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+fn print(value: Value) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+fn own_command(home: &Path, args: Vec<String>) -> Result<Vec<String>> {
+    let mut v = vec![
+        text(&std::env::current_exe()?)?,
+        "--home".into(),
+        text(home)?,
+    ];
+    v.extend(args);
+    Ok(v)
+}
+fn submit(
+    home: &Path,
+    queue: String,
+    key: String,
+    cwd: PathBuf,
+    command: Vec<String>,
+) -> Result<Value> {
+    call(
+        home,
+        &Request::Submit {
+            queue,
+            key,
+            cwd,
+            command,
+            callback: None,
+        },
+    )
+}
+fn observer_queue(id: i64, thread: &str) -> String {
+    format!("monohero-notify-{id}-{thread}")
+}
+fn running_job(home: &Path, queue: &str, key: &str) -> Result<Value> {
+    let jobs = call(
+        home,
+        &Request::Status {
+            queue: Some(queue.into()),
+        },
+    )?;
+    Ok(jobs
+        .as_array()
+        .context("invalid jobs")?
+        .iter()
+        .find(|j| j["key"] == key && j["state"] == "running")
+        .context("internal chat worker must be started by its running Monohero job")?
+        .clone())
+}
+fn reply(home: &Path, id: i64, thread: &str, op: &str, failed: bool) -> Result<()> {
+    validate_thread(thread)?;
+    let mut s = UnixStream::connect(home.join("chats").join(format!("{id}.sock")))
+        .context("no active chat socket; inspect job state, do not force-release")?;
+    s.set_read_timeout(Some(Duration::from_secs(15)))?;
+    writeln!(s, "{}", json!({"thread":thread,"op":op,"failed":failed}))?;
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line)?;
+    let response: Value = serde_json::from_str(&line)?;
+    if response["ok"] != true {
+        bail!("{}", response["error"]);
+    }
+    print(response)
+}
+pub fn run(action: Actions, home: &Path) -> Result<()> {
+    match action {
+        Actions::Enqueue {
+            queue,
+            key,
+            thread,
+            cwd,
+            codex,
+            message,
+        } => {
+            validate_thread(&thread)?;
+            name(&queue)?;
+            name(&key)?;
+            let codex = executable(&codex)?;
+            let cwd = fs::canonicalize(cwd.unwrap_or(std::env::current_dir()?))?;
+            let command = own_command(
+                home,
+                vec![
+                    "chat-worker".into(),
+                    "--queue".into(),
+                    queue.clone(),
+                    "--key".into(),
+                    key.clone(),
+                    "--thread".into(),
+                    thread,
+                    "--codex".into(),
+                    text(&codex)?,
+                    "--message".into(),
+                    message,
+                ],
+            )?;
+            print(submit(home, queue, key, cwd, command)?)
+        }
+        Actions::Claim { id, thread } => reply(home, id, &thread, "claim", false),
+        Actions::Finish { id, thread, failed } => reply(home, id, &thread, "finish", failed),
+        Actions::Acknowledge { id, thread } => reply(home, id, &thread, "acknowledge", false),
+        Actions::Notify { id, thread, codex } => {
+            validate_thread(&thread)?;
+            let jobs = call(home, &Request::Status { queue: None })?;
+            if !jobs
+                .as_array()
+                .context("invalid jobs")?
+                .iter()
+                .any(|j| j["id"] == id)
+            {
+                bail!("unknown target job");
+            }
+            let codex = executable(&codex)?;
+            let command = own_command(
+                home,
+                vec![
+                    "notify-worker".into(),
+                    id.to_string(),
+                    "--thread".into(),
+                    thread.clone(),
+                    "--codex".into(),
+                    text(&codex)?,
+                ],
+            )?;
+            print(submit(
+                home,
+                observer_queue(id, &thread),
+                "notify".into(),
+                fs::canonicalize(home)?,
+                command,
+            )?)
+        }
+        Actions::ChatWorker {
+            queue,
+            key,
+            thread,
+            codex,
+            message,
+        } => {
+            let job = running_job(home, &queue, &key)?;
+            let id = job["id"].as_i64().context("missing job ID")?;
+            let prompt=format!("Monohero: your turn in queue {queue}. Job {id}; worktree {}. The human owner authorized this existing chat to continue: {message}\nFirst confirm receipt using:\n{}\nIf claim fails, stop without doing protected work. Then complete the already-authorized protected work, preserving project approvals/checks/review/deploy/verification. Do not poll or enqueue recursively. After ALL protected work, execute:\n{}\nOn failure/blocker append --failed and explain. Do no protected work after finish. Acknowledging the grant alone is not completion.",job["cwd"].as_str().unwrap_or(""),control(home,"claim",id,&thread)?,control(home,"finish",id,&thread)?);
+            receive(home, id, &thread, "lease", &codex, &prompt)
+        }
+        Actions::NotifyWorker { id, thread, codex } => {
+            let job = running_job(home, &observer_queue(id, &thread), "notify")?;
+            let notice = job["id"].as_i64().context("missing notification job ID")?;
+            let result = call(home, &Request::Wait { id })?;
+            let prompt=format!("Monohero completion notice for job {id}; notification {notice}. The human owner authorized this existing chat to resume. First confirm receipt:\n{}\nActual job result:\n{}\nRead the saved evidence and report the outcome. Continue only already-authorized follow-up work. This notice grants NO release slot: new protected work must rejoin its project queue. Do not retry failed deployment automatically.",control(home,"acknowledge",notice,&thread)?,serde_json::to_string_pretty(&result)?);
+            receive(home, notice, &thread, "notice", &codex, &prompt)
+        }
+    }
+}
+fn quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+fn control(home: &Path, op: &str, id: i64, thread: &str) -> Result<String> {
+    let args = [
+        text(&std::env::current_exe()?)?,
+        "--home".into(),
+        text(home)?,
+        op.into(),
+        id.to_string(),
+        "--thread".into(),
+        thread.into(),
+    ];
+    Ok(args.iter().map(|s| quote(s)).collect::<Vec<_>>().join(" "))
+}
+struct SocketGuard(PathBuf);
+impl Drop for SocketGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+fn receive(
+    home: &Path,
+    id: i64,
+    thread: &str,
+    kind: &str,
+    codex: &Path,
+    prompt: &str,
+) -> Result<()> {
+    validate_thread(thread)?;
+    let dir = private_dir(home)?;
+    let socket = dir.join(format!("{id}.sock"));
+    let path = dir.join(format!("{id}.json"));
+    let listener = UnixListener::bind(&socket)
+        .context("chat socket exists; inspect its interrupted owner before retrying")?;
+    let _socket = SocketGuard(socket.clone());
+    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
+    let mut r = Receipt {
+        job_id: id,
+        thread_id: thread.into(),
+        kind: kind.into(),
+        state: "waiting_for_thread".into(),
+        message_id: None,
+        claimed_at: None,
+        updated_at: now(),
+        finish_requested: None,
+        error: None,
+    };
+    persist(&path, &mut r)?;
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(dir.join(format!("{thread}.lock")))?;
+    lock.lock_exclusive()?;
+    // A surviving dispatcher retains ownership if its worker is interrupted.
+    use std::os::fd::AsRawFd;
+    unsafe {
+        if libc::fcntl(lock.as_raw_fd(), libc::F_SETFD, 0) == -1 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    r.state = "dispatching".into();
+    persist(&path, &mut r)?;
+    match dispatch(codex, thread, prompt, home, id) {
+        Ok(message) => {
+            r.message_id = Some(message);
+            r.state = "message_queued".into();
+            persist(&path, &mut r)?;
+        }
+        Err(e) => {
+            r.state = "failed".into();
+            r.error = Some(format!("{e:#}"));
+            persist(&path, &mut r)?;
+            return Err(e);
+        }
+    }
+    // CLI acceptance is not proof of resumption. Wait for the actual chat's acknowledgement.
+    for stream in listener.incoming() {
+        let mut stream = stream?;
+        let result = (|| -> Result<bool> {
+            stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+            let mut line = String::new();
+            BufReader::new(stream.try_clone()?).read_line(&mut line)?;
+            let value: Value = serde_json::from_str(&line)?;
+            if value["thread"] != thread {
+                bail!("thread does not own this chat job");
+            }
+            match value["op"].as_str() {
+                Some("claim") if kind == "lease" => {
+                    r.claimed_at.get_or_insert_with(now);
+                    r.state = "claimed".into();
+                    persist(&path, &mut r)?;
+                    Ok(false)
+                }
+                Some("finish") if kind == "lease" => {
+                    if r.claimed_at.is_none() {
+                        bail!("claim the grant in its destination chat before finishing");
+                    }
+                    let failed = value["failed"]
+                        .as_bool()
+                        .context("failed must be boolean")?;
+                    r.finish_requested = Some(failed);
+                    r.state = if failed { "failed" } else { "completed" }.into();
+                    persist(&path, &mut r)?;
+                    Ok(true)
+                }
+                Some("acknowledge") if kind == "notice" => {
+                    r.claimed_at = Some(now());
+                    r.state = "completed".into();
+                    persist(&path, &mut r)?;
+                    Ok(true)
+                }
+                _ => bail!("operation does not match chat job kind"),
+            }
+        })();
+        match result {
+            Ok(done) => {
+                writeln!(stream, "{}", json!({"ok":true,"state":r.state}))?;
+                if done {
+                    if r.finish_requested == Some(true) {
+                        bail!("owner finished with failure; inspect its report");
+                    }
+                    return Ok(());
+                }
+            }
+            Err(e) => {
+                writeln!(stream, "{}", json!({"ok":false,"error":format!("{e:#}")}))?;
+            }
+        }
+    }
+    bail!("chat listener closed without completion")
+}
+fn dispatch(codex: &Path, thread: &str, prompt: &str, home: &Path, id: i64) -> Result<String> {
+    let out = Command::new(codex)
+        .args(["queue", "--thread", thread, "--message", prompt])
+        .env("MONOHERO_HOME", home)
+        .env("MONOHERO_JOB_ID", id.to_string())
+        .env("MONOHERO_THREAD_ID", thread)
+        .stdin(Stdio::null())
+        .output()
+        .context("unable to invoke codex queue")?;
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    print!("{stdout}");
+    eprint!("{stderr}");
+    if !out.status.success() {
+        bail!(
+            "codex queue failed: {}; no successful delivery recorded",
+            out.status
+        );
+    }
+    for line in stdout.lines() {
+        let parts = line.split_whitespace().collect::<Vec<_>>();
+        if parts.len() == 6
+            && parts[0] == "Queued"
+            && parts[1] == "message"
+            && parts[3] == "for"
+            && parts[4] == "thread"
+            && parts[5].strip_suffix('.') == Some(thread)
+            && validate_thread(parts[2]).is_ok()
+        {
+            return Ok(parts[2].into());
+        }
+    }
+    bail!("Codex did not confirm the exact destination thread; delivery is uncertain, do not retry blindly")
+}

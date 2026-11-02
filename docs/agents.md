@@ -1,62 +1,47 @@
 # Codex and Claude Code
 
-Copy the project-specific portion of [AGENT.md](../integrations/AGENT.md) into
-AGENTS.md or CLAUDE.md after choosing a queue and an executable workflow. You can
-feed that file's URL directly to your agent. `monohero guide` prints it offline.
-Do not overwrite existing project instructions. Installing Monohero does not change
-any project's instructions, hooks, permissions or release authorization.
+Use [AGENT.md](../integrations/AGENT.md) for feedable project instructions.
+Codex chat mode uses enqueue → native message → claim → work → finish.
+Existing command jobs use notify → native message → acknowledge.
 
-## Detached jobs: recommended
+## Transport and acceptance
 
-Prepare a script that performs the entire authorized operation, exits nonzero on
-failure and waits for all protected children. Submit once, keep the JSON ID, end
-the agent turn. No waiting chat needs to stay active. The service starts the next
-job automatically. On user resumption, read one status snapshot and the log.
+The selected CLI executes `codex queue --thread UUID --message TEXT`. The host
+consumes the queued message and resumes the existing chat. No model settings or
+permissions are overridden. No separate agent or conversation is created.
 
-```sh
-monohero submit --queue my-project-release --key task-42-attempt-1 \
-  --cwd /absolute/worktree -- /absolute/worktree/bin/release.sh
-```
+An exit-zero transport receipt only means message_queued. An explicit claim from
+the destination confirms resumption and retains ownership until finish. Notices
+require acknowledge and do not grant protected release ownership. Receipt JSON
+files record these phases separately. Unacknowledged delivery has no automatic
+expiry or blind retry.
 
-The script must include every exclusive step, including validation of the intended
-Git head and approvals. Submitting only `make test` does not protect a subsequent
-merge performed outside the job. Never submit a script that recursively submits
-to and waits on its own queue: that deadlocks.
+A real idle Codex desktop chat was used for acceptance during development: the CLI
+message started a new turn, which executed the requested diagnostic command and
+returned its confirmation. Test actual queued-message consumption on every new
+host. Do not assume a CLI receipt guarantees that all Codex versions/hosts wake.
 
-## Interactive reasoning
+## Why not exec resume or private desktop sockets
 
-Monohero cannot hand a lock to an arbitrary paused UI conversation. If a release
-needs an agent to interpret review findings, either stop the workflow for explicit
-human resolution, or authorize a script that runs the relevant CLI agent and waits
-for it. Put the exact task in a file, make the wrapper propagate exit status, and
-have the CLI stay attached until the entire operation is finished. Choose CLI
-flags according to the installed version's help; do not disable permission checks.
-This creates a separate CLI session and may use model tokens once its turn starts.
+An open desktop chat may retain its writer while idle. `codex exec resume` then
+fails with an active-writer error; starting another engine is not this handoff.
+The desktop app's private tools pipe is not a standalone external API. Monohero
+uses neither of these as a fallback, and does not bypass peer authorization or
+inject GUI keystrokes. The existing host owns and continues its own conversation.
 
-## Blocking wait and completion callbacks
+## Compatibility
 
-`monohero wait ID` is a single blocking subscription. It emits no intermediate
-progress. A client with event-driven background tool completion can await it.
-A client that repeatedly asks the model to poll tool status still spends tokens;
-Monohero cannot change that client's runtime. Prefer detached submission there.
+New client commands submit ordinary internal Rust workers through the stable
+command/wait protocol. They also work with a running 0.1.1 daemon. No active-job
+restart or database migration is required. Use a stable versioned binary path.
 
-An optional completion executable can notify a human or invoke an explicitly
-approved integration. It receives two arguments, ID and terminal job state, and
-runs from the job's working directory. It is never interpreted by a shell.
-Do not send chat messages, inject terminal keystrokes or launch another agent unless
-that action is separately authorized. Callback failures do not change job success;
-`status` includes `callback_state`. Callbacks are not replayed after a crash and do not run for cancelled or
-recovered/interrupted jobs.
+All worktrees of a project share queue/home, with individual --cwd and job keys.
+Observer queues never occupy the queue whose completion they await. Claimed chat
+slots remain occupied until explicit finish, including corrections and browser
+verification. Do no protected work after releasing a slot.
 
-## Hooks are not universal wakeups
+Claude command workflow mode remains available. Automatic Claude resumption is
+not implemented; never silently replace it with a new session.
 
-Codex and Claude have distinct hook lifecycles. A hook executes in response to a
-host event; it is not a general API for resuming a particular dormant conversation.
-This release deliberately installs no Stop hooks and claims no automatic UI resume.
-Do not attach a long queue wait to every Stop event: it can block unrelated turns
-and create repeated continuations. Use the explicit workflow submission above.
-
-Official references checked while writing this integration (2026-11-02):
-
-- [Codex hooks](https://learn.chatgpt.com/docs/hooks)
-- [Claude Code hooks](https://code.claude.com/docs/en/hooks)
+Sources: the installed `codex queue --help` and the official
+[queue command implementation](https://github.com/openai/codex/blob/main/codex-rs/tui/src/session_queue_commands.rs).

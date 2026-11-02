@@ -1,4 +1,5 @@
 #![cfg(unix)]
+mod chat;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
@@ -59,6 +60,8 @@ enum Action {
     Cancel { id: i64 },
     /// Print agent integration instructions.
     Guide,
+    #[command(flatten)]
+    Chat(chat::Actions),
 }
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "op")]
@@ -421,6 +424,7 @@ fn main() -> Result<()> {
     };
     let request = match cli.command {
         Action::Serve => return serve(home),
+        Action::Chat(action) => return chat::run(action, &home),
         Action::Submit {
             queue,
             key,
@@ -441,19 +445,24 @@ fn main() -> Result<()> {
         Action::Guide => unreachable!(),
     };
     let waiting = matches!(request, Request::Wait { .. });
-    let mut stream = UnixStream::connect(home.join("control.sock"))
-        .context("cannot reach Monohero; explicitly start `monohero serve` with the same --home")?;
-    writeln!(stream, "{}", serde_json::to_string(&request)?)?;
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line)?;
-    let response: serde_json::Value = serde_json::from_str(&line)
-        .context("daemon disconnected; inspect durable job state after restart")?;
-    if response["ok"] != true {
-        bail!("{}", response["error"]);
-    }
-    println!("{}", serde_json::to_string_pretty(&response["data"])?);
-    if waiting && response["data"]["state"] != "succeeded" {
+    let data = call(&home, &request)?;
+    println!("{}", serde_json::to_string_pretty(&data)?);
+    if waiting && data["state"] != "succeeded" {
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn call(home: &Path, request: &Request) -> Result<serde_json::Value> {
+    let mut stream = UnixStream::connect(home.join("control.sock"))
+        .context("cannot reach Monohero; start `monohero serve` with the same --home")?;
+    writeln!(stream, "{}", serde_json::to_string(request)?)?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    let response: serde_json::Value = serde_json::from_str(&line)
+        .context("daemon disconnected; inspect durable state before retrying")?;
+    if response["ok"] != true {
+        bail!("{}", response["error"]);
+    }
+    Ok(response["data"].clone())
 }
