@@ -33,6 +33,16 @@ pub enum Actions {
         codex: PathBuf,
         #[arg(long, default_value = "Continue the previously authorized task.")]
         message: String,
+        /// Explicitly authorize pausing this active goal until its queued grant.
+        #[arg(long)]
+        park_goal: bool,
+    },
+    /// Explicitly restore an unchanged goal left paused after cancellation/failure.
+    UnparkGoal {
+        #[arg(long)]
+        thread: String,
+        #[arg(long, default_value = "codex")]
+        codex: PathBuf,
     },
     /// Confirm in the destination chat that it received its queue grant.
     Claim {
@@ -74,6 +84,9 @@ pub enum Actions {
         codex: PathBuf,
         #[arg(long)]
         message: String,
+        /// Explicitly authorize pausing this active goal until its queued grant.
+        #[arg(long)]
+        park_goal: bool,
     },
     #[command(hide = true)]
     NotifyWorker {
@@ -226,13 +239,14 @@ pub fn run(action: Actions, home: &Path) -> Result<()> {
             cwd,
             codex,
             message,
+            park_goal,
         } => {
             validate_thread(&thread)?;
             name(&queue)?;
             name(&key)?;
             let codex = executable(&codex)?;
             let cwd = fs::canonicalize(cwd.unwrap_or(std::env::current_dir()?))?;
-            let command = own_command(
+            let mut command = own_command(
                 home,
                 vec![
                     "chat-worker".into(),
@@ -241,14 +255,45 @@ pub fn run(action: Actions, home: &Path) -> Result<()> {
                     "--key".into(),
                     key.clone(),
                     "--thread".into(),
-                    thread,
+                    thread.clone(),
                     "--codex".into(),
                     text(&codex)?,
                     "--message".into(),
                     message,
                 ],
             )?;
-            print(submit(home, queue, key, cwd, command)?)
+            if park_goal {
+                command.push("--park-goal".into());
+                let existing = call(
+                    home,
+                    &Request::Status {
+                        queue: Some(queue.clone()),
+                    },
+                )?;
+                if let Some(job) = existing
+                    .as_array()
+                    .context("invalid job list")?
+                    .iter()
+                    .find(|job| job["key"] == key)
+                {
+                    if job["command"] != serde_json::to_value(&command)?
+                        || job["cwd"] != text(&cwd)?
+                    {
+                        bail!("key already exists with different inputs; goal unchanged");
+                    }
+                    return print(
+                        json!({"id":job["id"],"queue":job["queue"],"state":job["state"]}),
+                    );
+                }
+                super::goal::park(home, &codex, &thread, &queue, &key)?;
+            }
+            let result = submit(home, queue, key, cwd, command).context("submission failed; if --park-goal was used, inspect HOME/goals and explicitly unpark the unchanged goal")?;
+            print(result)
+        }
+        Actions::UnparkGoal { thread, codex } => {
+            validate_thread(&thread)?;
+            super::goal::restore(home, &executable(&codex)?, &thread, None)?;
+            print(json!({"thread":thread,"goal":"restored"}))
         }
         Actions::Claim { id, thread } => reply(home, id, &thread, "claim", false),
         Actions::Finish { id, thread, failed } => reply(home, id, &thread, "finish", failed),
@@ -290,18 +335,27 @@ pub fn run(action: Actions, home: &Path) -> Result<()> {
             thread,
             codex,
             message,
+            park_goal,
         } => {
             let job = running_job(home, &queue, &key)?;
             let id = job["id"].as_i64().context("missing job ID")?;
             let prompt=format!("Monohero: your turn in queue {queue}. Job {id}; worktree {}. The human owner authorized this existing chat to continue: {message}\nFirst confirm receipt using:\n{}\nIf claim fails, stop without doing protected work. Then complete the already-authorized protected work, preserving project approvals/checks/review/deploy/verification. Do not poll or enqueue recursively. After ALL protected work, execute:\n{}\nOn failure/blocker append --failed and explain. Do no protected work after finish. Acknowledging the grant alone is not completion.",job["cwd"].as_str().unwrap_or(""),control(home,"claim",id,&thread)?,control(home,"finish",id,&thread)?);
-            receive(home, id, &thread, "lease", &codex, &prompt)
+            receive(
+                home,
+                id,
+                &thread,
+                "lease",
+                &codex,
+                &prompt,
+                park_goal.then_some((queue.as_str(), key.as_str())),
+            )
         }
         Actions::NotifyWorker { id, thread, codex } => {
             let job = running_job(home, &observer_queue(id, &thread), "notify")?;
             let notice = job["id"].as_i64().context("missing notification job ID")?;
             let result = call(home, &Request::Wait { id })?;
             let prompt=format!("Monohero completion notice for job {id}; notification {notice}. The human owner authorized this existing chat to resume. First confirm receipt:\n{}\nActual job result:\n{}\nRead the saved evidence and report the outcome. Continue only already-authorized follow-up work. This notice grants NO release slot: new protected work must rejoin its project queue. Do not retry failed deployment automatically.",control(home,"acknowledge",notice,&thread)?,serde_json::to_string_pretty(&result)?);
-            receive(home, notice, &thread, "notice", &codex, &prompt)
+            receive(home, notice, &thread, "notice", &codex, &prompt, None)
         }
     }
 }
@@ -333,6 +387,7 @@ fn receive(
     kind: &str,
     codex: &Path,
     prompt: &str,
+    parked_goal: Option<(&str, &str)>,
 ) -> Result<()> {
     validate_thread(thread)?;
     let dir = private_dir(home)?;
@@ -374,6 +429,14 @@ fn receive(
     match dispatch(codex, thread, prompt, home, id) {
         Ok(message) => {
             r.message_id = Some(message);
+            if let Some(owner) = parked_goal {
+                if let Err(error) = super::goal::restore(home, codex, thread, Some(owner)) {
+                    r.state = "failed".into();
+                    r.error = Some(format!("{error:#}"));
+                    persist(&path, &mut r)?;
+                    return Err(error);
+                }
+            }
             r.state = "message_queued".into();
             persist(&path, &mut r)?;
         }

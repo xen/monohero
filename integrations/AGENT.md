@@ -47,6 +47,39 @@ protected work after finish; only the final user report remains. The worker
 holds the slot until explicit matching finish. No timer expires it behind the
 chat's back. Monohero serializes its grants to the same thread across queues.
 
+## Existing goals while waiting
+
+An active Codex goal can schedule continuation turns independently of Monohero.
+Ending a turn alone does not guarantee silent waiting. By default Monohero
+leaves all goals unchanged; a goal may continue independent development.
+
+Only when the human explicitly authorizes pausing that goal for its queue wait,
+add `--park-goal` to `enqueue`. This requires an existing active goal. Monohero
+uses public app-server goal RPC without starting an inference session, saves
+the exact goal identity and budget, pauses it, and submits the chat job. After
+native message acceptance it restores that unchanged goal to active. Claim and
+finish are still mandatory. The objective, budget and accumulated usage stay
+intact. It never creates a replacement goal or bypasses limits.
+
+The CLI must support app-server goal get/set RPC. A changed goal, lifecycle
+timestamp or status causes visible refusal rather than an automatic overwrite.
+After cancellation or dispatch failure the goal stays paused. Inspect both the
+job and `HOME/goals/THREAD.json`, then explicitly restore an unchanged wait:
+
+```sh
+monohero unpark-goal --thread "$CODEX_THREAD_ID"
+```
+
+This command refuses queued/running jobs; cancel the wait first. Uncertain RPC
+results retain a `parking`/`restoring` receipt for manual inspection. Never retry
+such a lifecycle change blindly. Never use this flag to suppress useful goal
+work or pause a user's goal without their instruction. Verify actual host
+accounting/lifecycle behavior before enabling this mode in a project. The host
+must keep the lifecycle timestamp stable while paused; otherwise restoration
+refuses explicitly. The public API has no compare-and-set revision: simultaneous
+manual goal edits during the get/set RPC window cannot be made atomic by
+Monohero. Avoid editing a goal while explicitly changing its queue wait state.
+
 ## Existing command workflows: resume their owner on completion
 
 Submit the COMPLETE executable workflow, then register its exact owner:

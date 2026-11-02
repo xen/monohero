@@ -1,5 +1,6 @@
 #![cfg(unix)]
 mod chat;
+mod goal;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use fs2::FileExt;

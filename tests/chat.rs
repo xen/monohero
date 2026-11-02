@@ -312,3 +312,217 @@ fn invalid_thread_is_rejected_before_submission() {
     .success());
     assert_eq!(json(h, &["status"]).as_array().unwrap().len(), 0);
 }
+
+fn goal_stub(home: &Path, mode: &str) -> std::path::PathBuf {
+    let path = stub(home, mode);
+    let script = fs::read_to_string(&path).unwrap();
+    let insert = format!(
+        r#"
+if sys.argv[1:]==['app-server','--stdio']:
+ home=pathlib.Path({home:?});p=home/'fake-goal.json'
+ for line in sys.stdin:
+  row=json.loads(line)
+  if 'id' not in row:continue
+  method=row['method'];result={{}}
+  with (home/'goal-rpc.log').open('a') as log:log.write(method+'\n')
+  if method=='thread/goal/set' and (home/'rpc-error').exists():
+   print(json.dumps({{'id':row['id'],'error':{{'message':'refused'}}}}),flush=True);continue
+  if method=='thread/goal/get':result={{'goal':json.loads(p.read_text())}}
+  elif method=='thread/goal/set':
+   goal=json.loads(p.read_text());goal['status']=row['params']['status'];goal['updatedAt']+=1;p.write_text(json.dumps(goal));result={{'goal':goal}}
+  elif method!='initialize':raise RuntimeError(method)
+  print(json.dumps({{'id':row['id'],'result':result}}),flush=True)
+ sys.exit(0)
+"#,
+        home = home.to_str().unwrap()
+    );
+    fs::write(
+        &path,
+        script.replace(
+            "home=pathlib.Path(os.environ['MONOHERO_HOME'])",
+            &(insert + "\nhome=pathlib.Path(os.environ['MONOHERO_HOME'])"),
+        ),
+    )
+    .unwrap();
+    let goal = serde_json::json!({"threadId":THREAD,"status":"active","objective":"Finish the existing task","tokenBudget":12000,"tokensUsed":456,"timeUsedSeconds":78,"createdAt":1,"updatedAt":2});
+    fs::write(
+        home.join("fake-goal.json"),
+        serde_json::to_vec(&goal).unwrap(),
+    )
+    .unwrap();
+    path
+}
+fn parked_enqueue(h: &Path, codex: &Path, key: &str) -> i64 {
+    json(
+        h,
+        &[
+            "enqueue",
+            "--queue",
+            "p",
+            "--key",
+            key,
+            "--thread",
+            THREAD,
+            "--codex",
+            codex.to_str().unwrap(),
+            "--cwd",
+            h.to_str().unwrap(),
+            "--park-goal",
+        ],
+    )["id"]
+        .as_i64()
+        .unwrap()
+}
+fn read_goal(h: &Path) -> Value {
+    serde_json::from_slice(&fs::read(h.join("fake-goal.json")).unwrap()).unwrap()
+}
+#[test]
+fn parked_goal_waits_then_restores_only_after_native_grant() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "manual");
+    let first = enqueue(h, &codex, "p", "first", OTHER);
+    await_file(&h.join(format!("ready-{first}")));
+    let before = read_goal(h);
+    let next = parked_enqueue(h, &codex, "parked");
+    assert_eq!(read_goal(h)["status"], "paused");
+    assert!(!cli(
+        h,
+        &[
+            "unpark-goal",
+            "--thread",
+            THREAD,
+            "--codex",
+            codex.to_str().unwrap()
+        ]
+    )
+    .status
+    .success());
+    assert_eq!(read_goal(h)["status"], "paused");
+    assert_eq!(parked_enqueue(h, &codex, "parked"), next);
+    assert!(!h.join(format!("trace-{next}.json")).exists());
+    json(h, &["finish", &first.to_string(), "--thread", OTHER]);
+    await_file(&h.join(format!("ready-{next}")));
+    let after = read_goal(h);
+    assert_eq!(after["status"], "active");
+    for field in [
+        "objective",
+        "tokenBudget",
+        "tokensUsed",
+        "timeUsedSeconds",
+        "createdAt",
+    ] {
+        assert_eq!(before[field], after[field]);
+    }
+    finish(h, next);
+    assert!(wait(h, next).status.success());
+    assert_eq!(parked_enqueue(h, &codex, "parked"), next);
+    assert_eq!(read_goal(h), after);
+    let calls = fs::read_to_string(h.join("goal-rpc.log")).unwrap();
+    assert_eq!(calls.lines().filter(|l| *l == "thread/goal/set").count(), 2);
+}
+#[test]
+fn changed_goal_is_never_implicitly_restored() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "manual");
+    let first = enqueue(h, &codex, "p", "first", OTHER);
+    await_file(&h.join(format!("ready-{first}")));
+    let next = parked_enqueue(h, &codex, "parked");
+    let mut edited = read_goal(h);
+    edited["objective"] = "User changed the target".into();
+    edited["updatedAt"] = 99.into();
+    fs::write(
+        h.join("fake-goal.json"),
+        serde_json::to_vec(&edited).unwrap(),
+    )
+    .unwrap();
+    json(h, &["finish", &first.to_string(), "--thread", OTHER]);
+    assert!(!wait(h, next).status.success());
+    assert_eq!(read_goal(h), edited);
+    assert_eq!(receipt(h, next)["state"], "failed");
+    assert!(!cli(
+        h,
+        &[
+            "unpark-goal",
+            "--thread",
+            THREAD,
+            "--codex",
+            codex.to_str().unwrap()
+        ]
+    )
+    .status
+    .success());
+}
+#[test]
+fn cancellation_keeps_goal_paused_until_explicit_unpark() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "manual");
+    let first = enqueue(h, &codex, "p", "first", OTHER);
+    await_file(&h.join(format!("ready-{first}")));
+    let next = parked_enqueue(h, &codex, "parked");
+    json(h, &["cancel", &next.to_string()]);
+    assert_eq!(read_goal(h)["status"], "paused");
+    json(
+        h,
+        &[
+            "unpark-goal",
+            "--thread",
+            THREAD,
+            "--codex",
+            codex.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(read_goal(h)["status"], "active");
+    json(h, &["finish", &first.to_string(), "--thread", OTHER]);
+    assert!(wait(h, first).status.success());
+}
+
+#[test]
+fn failed_dispatch_leaves_parked_goal_for_explicit_recovery() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "fail");
+    let id = parked_enqueue(h, &codex, "parked");
+    assert!(!wait(h, id).status.success());
+    assert_eq!(read_goal(h)["status"], "paused");
+    json(
+        h,
+        &[
+            "unpark-goal",
+            "--thread",
+            THREAD,
+            "--codex",
+            codex.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(read_goal(h)["status"], "active");
+    assert_eq!(state(h, id), "failed");
+}
+#[test]
+fn uncertain_goal_rpc_is_not_retried_or_submitted() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "manual");
+    fs::write(h.join("rpc-error"), "").unwrap();
+    let args = [
+        "enqueue",
+        "--queue",
+        "p",
+        "--key",
+        "parked",
+        "--thread",
+        THREAD,
+        "--codex",
+        codex.to_str().unwrap(),
+        "--park-goal",
+    ];
+    assert!(!cli(h, &args).status.success());
+    assert_eq!(read_goal(h)["status"], "active");
+    fs::remove_file(h.join("rpc-error")).unwrap();
+    assert!(!cli(h, &args).status.success());
+    assert_eq!(json(h, &["status"]), serde_json::json!([]));
+    let log = fs::read_to_string(h.join("goal-rpc.log")).unwrap();
+    assert_eq!(log.lines().filter(|l| *l == "thread/goal/set").count(), 1);
+}
