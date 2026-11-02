@@ -37,6 +37,7 @@ enum Action {
         queue: String,
         #[arg(long)]
         key: String,
+        /// Working directory for this job; defaults to the submitting directory.
         #[arg(long)]
         cwd: Option<PathBuf>,
         /// Absolute executable invoked once after completion with job ID and state.

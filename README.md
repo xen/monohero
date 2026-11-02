@@ -26,7 +26,7 @@ short enough for Unix socket limits (about 100 bytes, platform dependent).
 In another terminal, submit an executable workflow:
 
 ```sh
-monohero submit --queue otkuda-release --key release-2026-11-02-001 \
+monohero submit --queue my-project-release --key release-2026-11-02-001 \
   --cwd /absolute/path/to/worktree -- /absolute/path/to/release.sh
 ```
 
@@ -37,9 +37,33 @@ which submissions are committed by the service. Different queues run concurrentl
 ```sh
 monohero submit --queue another-project-release --key release-001 \
   --cwd /absolute/path/to/another-project -- /absolute/path/to/release.sh
-monohero status --queue otkuda-release
+monohero status --queue my-project-release
 monohero wait 1
 ```
+
+### Worktrees and `--cwd`
+
+`--queue` chooses the shared queue. `--cwd` chooses the directory where **this
+job's command** runs; it does not create or select a queue. If omitted, Monohero
+captures your current directory when you submit the job. The service can be
+started from any directory.
+
+For two worktrees of one project, use the same queue name and submit from each
+worktree. Each command runs in its own worktree, one after the other:
+
+```sh
+cd /absolute/path/to/worktree-a
+monohero submit --queue my-project-release --key task-a -- ./bin/release.sh
+
+cd /absolute/path/to/worktree-b
+monohero submit --queue my-project-release --key task-b -- ./bin/release.sh
+```
+
+Equivalently, pass `--cwd /absolute/path/to/worktree-a` from any directory.
+Relative executable paths such as `./bin/release.sh` resolve inside that job's
+working directory. All clients must connect to the same service using the same
+`MONOHERO_HOME` (or its shared default). Keep each worktree available and unchanged
+until its job finishes. Use different keys for different worktree jobs.
 
 `status` is a single snapshot. `wait` blocks on a socket until terminal state,
 prints the job result and exits 0 only for success. Neither service scheduling nor

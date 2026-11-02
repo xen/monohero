@@ -10,9 +10,13 @@ hooks, send messages, change deployment policy, or launch releases implicitly.
 - Monohero executable on PATH (install: `cargo install --git https://github.com/xen/monohero --locked`).
 - One explicitly started `monohero serve` per user, supervised by launchd/systemd
   or kept in a terminal. All worktrees use the same MONOHERO_HOME.
-- An explicit queue name, e.g. `otkuda-release` or `jurkonsul-release`. Worktrees
+- An explicit queue name, e.g. `my-project-release` or `another-project-release`. Worktrees
   of the same project MUST share it. Different projects can use separate queues;
   projects sharing an exclusive resource can deliberately share one queue.
+- `--cwd` is the working directory of an individual job, not the queue identity.
+  Omit it to capture the directory from which submit runs. Different worktrees
+  submit with the same queue name and distinct job keys; each command runs in
+  its own captured directory. Keep queued worktrees unchanged until completion.
 - An executable project workflow that completes the authorized operation and
   exits. It must stop on errors, propagate exit codes, and never detach protected
   work. Keep sync, checks, review, merge and deploy inside the same job when the

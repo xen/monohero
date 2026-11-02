@@ -223,3 +223,44 @@ fn missing_executable_is_failure_and_callback_runs() {
         format!("{id} failed")
     );
 }
+
+#[test]
+fn worktrees_share_queue_but_keep_their_own_working_directories() {
+    let s = server();
+    let h = s.home.path();
+    let a = h.join("worktree-a");
+    let b = h.join("worktree-b");
+    fs::create_dir(&a).unwrap();
+    fs::create_dir(&b).unwrap();
+    let script = "#!/bin/sh\npwd > result\n";
+    use std::os::unix::fs::PermissionsExt;
+    for dir in [&a, &b] {
+        fs::write(dir.join("run.sh"), script).unwrap();
+        fs::set_permissions(dir.join("run.sh"), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let submit_from = |dir: &Path, key: &str| {
+        let r = Command::new(env!("CARGO_BIN_EXE_monohero"))
+            .arg("--home")
+            .arg(h)
+            .args([
+                "submit", "--queue", "shared", "--key", key, "--", "./run.sh",
+            ])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        assert!(r.status.success(), "{}", String::from_utf8_lossy(&r.stderr));
+        serde_json::from_slice::<Value>(&r.stdout).unwrap()["id"]
+            .as_i64()
+            .unwrap()
+    };
+    let first = submit_from(&a, "a");
+    let second = submit_from(&b, "b");
+    assert!(first < second);
+    assert!(wait(h, second).status.success());
+    for dir in [&a, &b] {
+        assert_eq!(
+            fs::canonicalize(fs::read_to_string(dir.join("result")).unwrap().trim()).unwrap(),
+            fs::canonicalize(dir).unwrap()
+        );
+    }
+}
