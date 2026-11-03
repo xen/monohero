@@ -85,12 +85,13 @@ Failed and interrupted jobs block their queue. `resolve` acknowledges inspection
 retains the log and exit code, and lets later jobs proceed. It never retries.
 Unknown IDs and invalid transitions are explicit errors. There is no force-unlock.
 
-## Give this to your agent
+## Use
 
-> Read https://github.com/xen/monohero/blob/main/integrations/AGENT.md and integrate
-> Monohero into my project's Codex/Claude instructions. Use queue `my-project-release`.
-> Preserve existing release approvals and checks. Prepare the executable workflow;
-> do not release anything until I authorize it.
+Copy and send this to your agent:
+
+```text
+Read https://github.com/xen/monohero/blob/main/integrations/AGENT.md and set up Monohero for this project's Codex/Claude instructions, choosing a unique queue name based on the project name. Preserve existing release approvals and checks.
+```
 
 The same instruction is available locally with `monohero guide`. See the complete
 [agent integration guide](integrations/AGENT.md), plus
