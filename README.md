@@ -6,6 +6,18 @@ without asking a model for status. Written in Rust. macOS and Linux.
 Give each project its own queue, or deliberately share a queue when projects
 compete for the same resource. All worktrees use the same service and queue name.
 
+## Use
+
+Copy and send this to your agent:
+
+```text
+Read https://github.com/xen/monohero/blob/main/integrations/AGENT.md and set up Monohero for this project's Codex/Claude instructions, choosing a unique queue name based on the project name. Preserve existing release approvals and checks.
+```
+
+The same instruction is available locally with `monohero guide`. See the complete
+[agent integration guide](integrations/AGENT.md), plus
+[Codex and Claude examples](docs/agents.md).
+
 ## Install
 
 Requires Rust 1.81+, a C compiler (bundled SQLite), and Git.
@@ -21,7 +33,7 @@ startup configuration. Default state: `~/.local/state/monohero`. Override with
 `MONOHERO_HOME` or `--home /absolute/short/path` on **every** command. Keep the path
 short enough for Unix socket limits (about 100 bytes, platform dependent).
 
-## Use
+## Command-line usage
 
 In another terminal, submit an executable workflow:
 
@@ -84,18 +96,6 @@ monohero resolve 2  # after inspecting a failed/interrupted job
 Failed and interrupted jobs block their queue. `resolve` acknowledges inspection,
 retains the log and exit code, and lets later jobs proceed. It never retries.
 Unknown IDs and invalid transitions are explicit errors. There is no force-unlock.
-
-## Use
-
-Copy and send this to your agent:
-
-```text
-Read https://github.com/xen/monohero/blob/main/integrations/AGENT.md and set up Monohero for this project's Codex/Claude instructions, choosing a unique queue name based on the project name. Preserve existing release approvals and checks.
-```
-
-The same instruction is available locally with `monohero guide`. See the complete
-[agent integration guide](integrations/AGENT.md), plus
-[Codex and Claude examples](docs/agents.md).
 
 Command mode runs executable workflows. For existing Codex conversations, use the
 explicit enqueue/finish and notify modes described below. It does not wake arbitrary UI chats.
