@@ -1174,3 +1174,28 @@ fn archived_managed_chat_drains_running_protected_work_before_next_job() {
     assert!(wait(h, b).status.success());
     assert_eq!(state(h, a), "cancelled");
 }
+
+#[test]
+fn archived_cancellation_never_resolves_a_failure_barrier() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "manual");
+    let failed = submit(h, "p", "failed-barrier", "exit 1");
+    assert!(!wait(h, failed).status.success());
+    let archived = enqueue(h, &codex, "p", "archived-behind-failure", THREAD);
+    fs::write(
+        h.join("fake-archived.json"),
+        serde_json::to_vec(&serde_json::json!([{"id":THREAD}])).unwrap(),
+    )
+    .unwrap();
+    assert!(cli(
+        h,
+        &["monitor", "--codex", codex.to_str().unwrap(), "--once"]
+    )
+    .status
+    .success());
+    assert_eq!(state(h, archived), "cancelled");
+    assert_eq!(state(h, failed), "failed");
+    let next = submit(h, "p", "after-barrier", "true");
+    assert_eq!(state(h, next), "queued");
+}
