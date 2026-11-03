@@ -137,3 +137,16 @@ Use `monohero queue` for a readable snapshot of all unfinished queues, or
 positions, running jobs, blocked jobs, worktrees and destination chat IDs.
 `--all` includes history; `--json` returns structured selected jobs. It exits
 after one read. Do not turn this command into a model polling loop.
+
+## Native desktop wake
+
+If this Codex desktop host leaves unloaded chats at `message_queued`, configure
+its supported native URL opener once: on macOS, `monohero configure-wake
+--opener /usr/bin/open`. The command explicitly enables opening/selecting the
+existing destination chat after accepted delivery, without another message.
+This can bring the app forward. There is no automatic retry, alternate session
+or bypass of claim/finish. Verify actual destination claim on the installed
+host; opening a URL is not evidence of task execution. Opener failure records
+the already accepted message and leaves an explicit failed-job barrier. Queued
+workers using the updated CLI read the shared setting when they dispatch;
+currently running workers remain unchanged.

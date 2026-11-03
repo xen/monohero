@@ -526,3 +526,75 @@ fn uncertain_goal_rpc_is_not_retried_or_submitted() {
     let log = fs::read_to_string(h.join("goal-rpc.log")).unwrap();
     assert_eq!(log.lines().filter(|l| *l == "thread/goal/set").count(), 1);
 }
+
+fn opener(home: &Path, failed: bool) -> std::path::PathBuf {
+    let path = home.join("native-opener");
+    fs::write(&path, format!(r#"#!/usr/bin/env python3
+import json,os,pathlib,subprocess,sys
+home=pathlib.Path(os.environ['MONOHERO_HOME']);job=os.environ['MONOHERO_JOB_ID']
+trace=json.loads((home/('trace-'+job+'.json')).read_text())
+thread=os.environ['MONOHERO_THREAD_ID']
+assert sys.argv[1:] == ['codex://threads/'+thread]
+with (home/'wake-calls').open('a') as stream:stream.write(sys.argv[1]+'\n')
+if {failure}:sys.exit(7)
+subprocess.Popen([sys.executable,str(home/'codex-stub'),'__agent__',thread,trace['prompt']],stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+"#, failure = if failed { "True" } else { "False" })).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+    path
+}
+
+#[test]
+fn configured_native_wake_loads_destination_after_delivery_and_requires_finish() {
+    let s = server();
+    let h = s.home.path();
+    let codex = stub(h, "queued-only");
+    let open = opener(h, false);
+    json(h, &["configure-wake", "--opener", open.to_str().unwrap()]);
+    let a = enqueue(h, &codex, "p", "native-wake", THREAD);
+    await_file(&h.join(format!("ready-{a}")));
+    assert_eq!(receipt(h, a)["state"], "claimed");
+    assert_eq!(receipt(h, a)["app_wake"], "requested");
+    assert_eq!(state(h, a), "running");
+    let b = submit(h, "p", "after-wake", "true");
+    assert_eq!(state(h, b), "queued");
+    assert_eq!(enqueue(h, &codex, "p", "native-wake", THREAD), a);
+    assert_eq!(
+        fs::read_to_string(h.join("wake-calls")).unwrap(),
+        format!("codex://threads/{THREAD}\n")
+    );
+    finish(h, a);
+    assert!(wait(h, b).status.success());
+}
+
+#[test]
+fn failed_native_wake_preserves_accepted_message_and_failure_barrier_without_retry() {
+    let s = server();
+    let h = s.home.path();
+    let codex = stub(h, "queued-only");
+    let open = opener(h, true);
+    json(h, &["configure-wake", "--opener", open.to_str().unwrap()]);
+    let a = enqueue(h, &codex, "p", "failed-wake", THREAD);
+    assert!(!wait(h, a).status.success());
+    let r = receipt(h, a);
+    assert_eq!(r["state"], "failed");
+    assert!(r["message_id"].as_str().is_some());
+    assert!(r["claimed_at"].is_null());
+    assert!(r["error"]
+        .as_str()
+        .unwrap()
+        .contains("wake failed after message acceptance"));
+    let b = submit(h, "p", "must-wait", "true");
+    assert_eq!(state(h, b), "queued");
+    assert_eq!(enqueue(h, &codex, "p", "failed-wake", THREAD), a);
+    assert_eq!(
+        fs::read_to_string(h.join("wake-calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(!cli(h, &["configure-wake", "--opener", "relative-opener"])
+        .status
+        .success());
+}
