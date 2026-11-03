@@ -100,21 +100,35 @@ pub fn run(home: &Path, id: i64, thread: &str, command: &[String]) -> Result<()>
             return Err(std::io::Error::last_os_error().into());
         }
     }
-    let status = Command::new(&command[0])
+    let status = match Command::new(&command[0])
         .args(&command[1..])
         .stdin(Stdio::inherit())
         .status()
-        .context("cannot start protected command")?;
+    {
+        Ok(status) => status,
+        Err(error) => {
+            record_failure(
+                home,
+                id,
+                &format!("Protected command could not start: {error}"),
+            )?;
+            return Err(error).context("cannot start protected command");
+        }
+    };
     if !status.success() {
-        let mut marker = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .mode(0o600)
-            .open(directory(home)?.join(format!("{id}.command-failed")))?;
-        writeln!(marker, "Protected command failed: {status}")?;
-        marker.sync_all()?;
+        record_failure(home, id, &format!("Protected command failed: {status}"))?;
         std::process::exit(status.code().unwrap_or(1));
     }
+    Ok(())
+}
+fn record_failure(home: &Path, id: i64, reason: &str) -> Result<()> {
+    let mut marker = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(directory(home)?.join(format!("{id}.command-failed")))?;
+    writeln!(marker, "{reason}")?;
+    marker.sync_all()?;
     Ok(())
 }
 

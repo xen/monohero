@@ -544,14 +544,14 @@ fn receive(
                     let failed = value["failed"]
                         .as_bool()
                         .context("failed must be boolean")?;
-                    if managed && !failed && crate::fence::has_failure(home, id) {
-                        bail!("a protected command failed; inspect effects and finish --failed or explicitly yield");
-                    }
                     let _resource = if managed {
                         Some(crate::fence::finish_guard(home, id)?)
                     } else {
                         None
                     };
+                    if managed && !failed && crate::fence::has_failure(home, id) {
+                        bail!("a protected command failed; inspect effects and finish --failed or explicitly yield");
+                    }
                     r.finish_requested = Some(failed);
                     r.state = if failed { "failed" } else { "completed" }.into();
                     persist(&path, &mut r)?;

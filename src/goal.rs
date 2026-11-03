@@ -233,11 +233,38 @@ pub fn restore(home: &Path, codex: &Path, thread: &str, owner: Option<(&str, &st
             .iter()
             .find(|job| job["key"] == record.key)
         {
-            if !matches!(
-                job["state"].as_str(),
-                Some("cancelled" | "failed" | "interrupted" | "resolved")
-            ) {
-                bail!("cancel or inspect the original job before explicitly unparking its goal");
+            let rows = jobs.as_array().context("invalid jobs")?;
+            let mut owned =
+                std::collections::HashSet::from([job["id"].as_i64().context("invalid job ID")?]);
+            loop {
+                let old_len = owned.len();
+                for candidate in rows {
+                    if candidate["parent_id"]
+                        .as_i64()
+                        .is_some_and(|parent| owned.contains(&parent))
+                    {
+                        owned.insert(candidate["id"].as_i64().context("invalid successor ID")?);
+                    }
+                }
+                if owned.len() == old_len {
+                    break;
+                }
+            }
+            for candidate in rows.iter().filter(|candidate| {
+                candidate["id"]
+                    .as_i64()
+                    .is_some_and(|id| owned.contains(&id))
+            }) {
+                let replaced = candidate["state"] == "requeued"
+                    && rows.iter().any(|next| next["parent_id"] == candidate["id"]);
+                if !replaced
+                    && !matches!(
+                        candidate["state"].as_str(),
+                        Some("cancelled" | "failed" | "interrupted" | "resolved")
+                    )
+                {
+                    bail!("cancel or inspect the original job and every live successor before explicitly unparking its goal");
+                }
             }
         }
     }

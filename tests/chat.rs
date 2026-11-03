@@ -1010,3 +1010,90 @@ fn explicit_worker_adoption_preserves_queued_identity_and_submitted_arguments() 
     finish(h, a);
     assert!(wait(h, a).status.success());
 }
+
+#[test]
+fn missing_protected_executable_retains_failure_barrier() {
+    let s = server();
+    let h = s.home.path();
+    let codex = stub(h, "manual");
+    let a = enqueue(h, &codex, "p", "missing-protected", THREAD);
+    await_file(&h.join(format!("ready-{a}")));
+    let missing = h.join("missing-release-tool");
+    assert!(!cli(
+        h,
+        &[
+            "run",
+            &a.to_string(),
+            "--thread",
+            THREAD,
+            "--",
+            missing.to_str().unwrap()
+        ]
+    )
+    .status
+    .success());
+    assert!(h
+        .join("leases")
+        .join(format!("{a}.command-failed"))
+        .exists());
+    assert!(!cli(h, &["finish", &a.to_string(), "--thread", THREAD])
+        .status
+        .success());
+    assert_eq!(state(h, a), "running");
+    json(
+        h,
+        &["finish", &a.to_string(), "--thread", THREAD, "--failed"],
+    );
+    assert!(!wait(h, a).status.success());
+    let b = submit(h, "p", "next-after-missing", "true");
+    assert_eq!(state(h, b), "queued");
+    json(h, &["resolve", &a.to_string()]);
+    assert!(wait(h, b).status.success());
+}
+
+#[test]
+fn explicit_goal_recovery_checks_all_replacement_owners() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "manual");
+    json(h, &["policy", "--queue", "p", "--blocked", "attention"]);
+    json(h, &["pause-queue", "p"]);
+    let original = read_goal(h);
+    let a = parked_enqueue(h, &codex, "recovery-chain");
+    json(h, &["defer", &a.to_string(), "--reason", "Needs input"]);
+    let b = json(h, &["resume", &a.to_string()])["new_job"]
+        .as_i64()
+        .unwrap();
+    json(
+        h,
+        &["defer", &b.to_string(), "--reason", "Still needs input"],
+    );
+    let c = json(h, &["resume", &b.to_string()])["new_job"]
+        .as_i64()
+        .unwrap();
+    let recover = [
+        "unpark-goal",
+        "--thread",
+        THREAD,
+        "--codex",
+        codex.to_str().unwrap(),
+    ];
+    assert!(!cli(h, &recover).status.success());
+    assert_eq!(read_goal(h)["status"], "paused");
+    json(h, &["cancel", &c.to_string()]);
+    json(h, &recover);
+    let restored = read_goal(h);
+    assert_eq!(restored["status"], "active");
+    for field in [
+        "objective",
+        "tokenBudget",
+        "tokensUsed",
+        "timeUsedSeconds",
+        "createdAt",
+    ] {
+        assert_eq!(restored[field], original[field]);
+    }
+    assert_eq!(state(h, a), "requeued");
+    assert_eq!(state(h, b), "requeued");
+    assert_eq!(state(h, c), "cancelled");
+}
