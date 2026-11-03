@@ -332,9 +332,14 @@ if sys.argv[1:] in [['app-server','--stdio'],['app-server','proxy']]:
   with (home/'goal-rpc.log').open('a') as log:log.write(method+'\n')
   if method=='thread/goal/set' and (home/'rpc-error').exists():
    print(json.dumps({{'id':row['id'],'error':{{'message':'refused'}}}}),flush=True);continue
+  if method=='thread/list' and (home/'archive-error').exists():
+   print(json.dumps({{'id':row['id'],'error':{{'message':'archive unavailable'}}}}),flush=True);continue
   if method=='thread/goal/get':result={{'goal':json.loads(p.read_text())}}
   elif method=='thread/goal/set':
    goal=json.loads(p.read_text());goal['status']=row['params']['status'];goal['updatedAt']+=1;p.write_text(json.dumps(goal));result={{'goal':goal}}
+  elif method=='thread/list':
+   assert row['params']['archived'] is True
+   result={{'data':json.loads((home/'fake-archived.json').read_text()) if (home/'fake-archived.json').exists() else [],'nextCursor':None}}
   elif method=='thread/read':
    status=json.loads((home/'fake-runtime.json').read_text()) if (home/'fake-runtime.json').exists() else {{'type':'notLoaded'}}
    result={{'thread':{{'id':row['params']['threadId'],'status':status}}}}
@@ -1096,4 +1101,101 @@ fn explicit_goal_recovery_checks_all_replacement_owners() {
     assert_eq!(state(h, a), "requeued");
     assert_eq!(state(h, b), "requeued");
     assert_eq!(state(h, c), "cancelled");
+}
+
+#[test]
+fn monitor_cancels_only_jobs_of_confirmed_archived_chats() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "manual");
+    json(h, &["policy", "--queue", "p", "--blocked", "attention"]);
+    json(h, &["pause-queue", "p"]);
+    let archived = enqueue(h, &codex, "p", "archived", THREAD);
+    let active = enqueue(h, &codex, "p", "active", OTHER);
+    fs::write(
+        h.join("fake-archived.json"),
+        serde_json::to_vec(&serde_json::json!([{"id": THREAD}])).unwrap(),
+    )
+    .unwrap();
+    assert!(cli(
+        h,
+        &["monitor", "--codex", codex.to_str().unwrap(), "--once"],
+    )
+    .status
+    .success());
+    assert_eq!(state(h, archived), "cancelled");
+    assert_eq!(state(h, active), "queued");
+}
+
+#[test]
+fn unavailable_archive_list_never_cancels_a_job() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "manual");
+    json(h, &["policy", "--queue", "p", "--blocked", "attention"]);
+    json(h, &["pause-queue", "p"]);
+    let job = enqueue(h, &codex, "p", "unknown-archive", THREAD);
+    fs::write(h.join("archive-error"), "").unwrap();
+    assert!(cli(
+        h,
+        &["monitor", "--codex", codex.to_str().unwrap(), "--once"]
+    )
+    .status
+    .success());
+    assert_eq!(state(h, job), "queued");
+}
+
+#[test]
+fn archived_managed_chat_drains_running_protected_work_before_next_job() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "manual");
+    let a = enqueue(h, &codex, "p", "archived-running", THREAD);
+    await_file(&h.join(format!("ready-{a}")));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_monohero"))
+        .arg("--home").arg(h).args(["run", &a.to_string(), "--thread", THREAD, "--", "/bin/sh", "-c", "touch protected-started; while [ ! -f release ]; do sleep 0.01; done; touch protected-finished"])
+        .current_dir(h).stdout(Stdio::null()).spawn().unwrap();
+    await_file(&h.join("protected-started"));
+    let b = submit(h, "p", "next", "test -f protected-finished");
+    fs::write(
+        h.join("fake-archived.json"),
+        serde_json::to_vec(&serde_json::json!([{"id": THREAD}])).unwrap(),
+    )
+    .unwrap();
+    assert!(cli(
+        h,
+        &["monitor", "--codex", codex.to_str().unwrap(), "--once"]
+    )
+    .status
+    .success());
+    assert_eq!(state(h, b), "queued");
+    fs::write(h.join("release"), "").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(wait(h, b).status.success());
+    assert_eq!(state(h, a), "cancelled");
+}
+
+#[test]
+fn archived_cancellation_never_resolves_a_failure_barrier() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "manual");
+    let failed = submit(h, "p", "failed-barrier", "exit 1");
+    assert!(!wait(h, failed).status.success());
+    let archived = enqueue(h, &codex, "p", "archived-behind-failure", THREAD);
+    fs::write(
+        h.join("fake-archived.json"),
+        serde_json::to_vec(&serde_json::json!([{"id":THREAD}])).unwrap(),
+    )
+    .unwrap();
+    assert!(cli(
+        h,
+        &["monitor", "--codex", codex.to_str().unwrap(), "--once"]
+    )
+    .status
+    .success());
+    assert_eq!(state(h, archived), "cancelled");
+    assert_eq!(state(h, failed), "failed");
+    let next = submit(h, "p", "after-barrier", "true");
+    assert_eq!(state(h, next), "queued");
 }

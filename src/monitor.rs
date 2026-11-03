@@ -9,7 +9,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::OpenOptionsExt,
@@ -140,6 +140,19 @@ fn round(home: &Path, codex: &Path, proxy: bool, socket: Option<&Path>) -> Resul
     let status = call(home, &Request::Status { queue: None })?;
     let jobs: Vec<Job> = serde_json::from_value(status)?;
     let mut client = Rpc::connect(codex, proxy, socket);
+    let archived = match client.as_mut() {
+        Ok(client) => match archived_threads(client) {
+            Ok(threads) => Some(threads),
+            Err(error) => {
+                eprintln!("chat monitor: archived-thread lookup failed: {error:#}");
+                None
+            }
+        },
+        Err(error) => {
+            eprintln!("chat monitor: archived-thread lookup unavailable: {error:#}");
+            None
+        }
+    };
     let mut cache = HashMap::<String, Value>::new();
     for job in jobs.iter().filter(|job| {
         !job.archived && matches!(job.state.as_str(), "running" | "queued" | "deferred")
@@ -147,6 +160,23 @@ fn round(home: &Path, codex: &Path, proxy: bool, socket: Option<&Path>) -> Resul
         let Some(thread) = management::thread_id(job) else {
             continue;
         };
+        if archived
+            .as_ref()
+            .is_some_and(|threads| threads.contains(&thread))
+        {
+            if let Err(error) = call(
+                home,
+                &Request::Manage {
+                    action: Control::CancelArchived { id: job.id },
+                },
+            ) {
+                eprintln!(
+                    "chat monitor: archived job {} could not be cancelled: {error:#}",
+                    job.id
+                );
+            }
+            continue;
+        }
         let observation = cache
             .entry(thread.clone())
             .or_insert_with(|| match client.as_mut() {
@@ -168,6 +198,35 @@ fn round(home: &Path, codex: &Path, proxy: bool, socket: Option<&Path>) -> Resul
         )?;
     }
     Ok(())
+}
+fn archived_threads(client: &mut Rpc) -> Result<HashSet<String>> {
+    let mut threads = HashSet::new();
+    let mut cursor = Value::Null;
+    loop {
+        let page = client.request(
+            "thread/list",
+            json!({"archived":true,"limit":100,"cursor":cursor,"useStateDbOnly":true}),
+        )?;
+        for entry in page["data"]
+            .as_array()
+            .context("invalid archived-thread list")?
+        {
+            threads.insert(
+                entry["id"]
+                    .as_str()
+                    .context("archived thread has no ID")?
+                    .to_owned(),
+            );
+        }
+        let next = page["nextCursor"].clone();
+        if next.is_null() {
+            return Ok(threads);
+        }
+        if !next.is_string() || next == cursor {
+            bail!("archived-thread pagination did not advance");
+        }
+        cursor = next;
+    }
 }
 fn unknown(thread: &str, reason: &str) -> Value {
     json!({"thread_id":thread,"state":"unknown","source":"unavailable","observed_at":now(),"reason":reason.chars().take(1000).collect::<String>(),"authoritative":false})
