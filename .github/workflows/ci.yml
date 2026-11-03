@@ -17,3 +17,16 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo build --release --locked
+  desktop:
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '15.0'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.99.1
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --manifest-path desktop/Cargo.toml --check
+      - run: cargo clippy --manifest-path desktop/Cargo.toml --locked --all-targets -- -D warnings
+      - run: cargo test --manifest-path desktop/Cargo.toml --locked
+      - run: cargo build --manifest-path desktop/Cargo.toml --release --locked

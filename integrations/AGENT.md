@@ -150,3 +150,26 @@ host; opening a URL is not evidence of task execution. Opener failure records
 the already accepted message and leaves an explicit failed-job barrier. Queued
 workers using the updated CLI read the shared setting when they dispatch;
 currently running workers remain unchanged.
+
+## Managed grants and blocked chats (0.4+)
+
+Use one project queue across its worktrees. The native dashboard is
+`monohero dashboard`; closing its window leaves the macOS menu-bar icon and queue
+service available. Queue policy can put blocked chats in an attention list or
+hold them at the tail. Native monitoring reads metadata, without model calls.
+Persisted history is labelled separately from an attached owning runtime;
+unknown/unavailable status is not permission to release claimed work.
+
+A managed invitation includes the exact `monohero run JOB_ID --thread CHAT_UUID
+-- COMMAND ARGS` prefix. Run every protected shell, test, Git, review, merge and
+deployment operation under that prefix. Wait for its children to finish. After
+revocation, stale commands fail: stop and wait for a fresh invitation, rather
+than bypassing the wrapper. The wrapper does not provide release authorization
+or replace project checks.
+
+Before asking the user for input that prevents progress, finish protected
+children and yield with `monohero defer JOB_ID --thread CHAT_UUID --reason TEXT`.
+This is also required for legacy claimed grants, which cannot be safely revoked
+from an inactivity signal. If a protected command failed, inspect its effects
+before yielding; automated revocation retains the grant until that inspection.
+A resumed grant gets a new job identity at the tail. Never reuse the old claim.

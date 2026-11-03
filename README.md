@@ -33,6 +33,67 @@ startup configuration. Default state: `~/.local/state/monohero`. Override with
 `MONOHERO_HOME` or `--home /absolute/short/path` on **every** command. Keep the path
 short enough for Unix socket limits (about 100 bytes, platform dependent).
 
+## Desktop dashboard
+
+The native desktop app uses [GPUI Kit](https://gpui-kit.com/). Build it separately
+so the command-line service retains its Rust 1.81 requirement. The desktop app
+requires Rust 1.99.1+, Xcode with Metal tools and macOS 15+ on macOS:
+
+```sh
+MACOSX_DEPLOYMENT_TARGET=15.0 cargo +1.99.1 build --release --locked --manifest-path desktop/Cargo.toml
+monohero dashboard --ui "$PWD/desktop/target/release/monohero-ui"
+```
+
+On macOS the menu-bar icon opens the queues window. Closing or hiding that window
+keeps the app available in the menu bar; quitting the dashboard leaves the queue
+service running. `monohero dashboard --hidden` starts with the window hidden.
+Install `monohero-ui` beside the CLI to omit `--ui`. Both use the same `--home`.
+Use `./scripts/bundle-macos.sh` to create `dist/Monohero.app`; this is an ad-hoc
+signed local bundle, not an Apple-notarized distribution.
+
+The dashboard shows independent project queues, chat observations, failure
+barriers and work directories. Move waiting jobs up/down, pause admission, resume
+deferred jobs at the tail, cancel pending work, clear history or delete queues.
+Destructive actions require confirmation. Clearing keeps durable job keys and
+audit records, preventing an old submission from running again accidentally.
+Running command workflows cannot be force-cancelled. Failed/interrupted effects
+must be inspected before acknowledging their barrier.
+
+### Blocked chats and monitoring
+
+Choose a policy per queue: an attention list (manual resume) or a held position at
+the tail. A held chat cannot be granted again until new evidence shows it ready.
+
+```sh
+monohero policy --queue my-project-release --blocked attention --unclaimed-after 180
+monohero configure-monitor --codex /absolute/path/to/codex --interval 15
+```
+
+Monitoring makes read-only native RPC requests; it never invokes a model or sends
+periodic status prompts. The default Codex history connection observes persisted
+turn/goal metadata. It cannot prove the desktop runtime's live approval/input
+state. Configure `--proxy [--socket /absolute/public/control.sock]` only for the
+owning host's public app-server proxy. Connection errors stay visible as unknown;
+Monohero does not switch to a different connection or use private desktop sockets.
+
+New chat grants require protected commands to run through
+`monohero run JOB_ID --thread CHAT_UUID -- COMMAND ARGS`. Deferral first stops new
+commands, then waits for inherited command locks to drain. A failed protected
+command preserves ownership until the owner inspects effects and explicitly
+yields. Existing legacy claimed grants require owner cooperation and are never
+revoked based on inactivity. Future native workers launched by the updated
+executable adopt this fencing protocol; stored submission arguments stay intact.
+
+After a controlled service upgrade, explicitly adopt pending native workers from
+an older version with `monohero adopt-workers --from /absolute/old/monohero`.
+This preserves their job IDs, order, immutable arguments and saved goal keys;
+only future matching native workers use the upgraded executable and fencing.
+Running grants are unaffected. Inspect all queues and stop the old service only
+when no job or completion callback is running. Never restart over protected work.
+
+Queue management is also available through `reorder`, `defer`, `resume`,
+`pause-queue`, `resume-queue`, `clear` and `inspect`; consult each command's `--help`.
+
 ## Command-line usage
 
 In another terminal, submit an executable workflow:
