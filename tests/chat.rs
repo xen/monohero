@@ -1144,3 +1144,33 @@ fn unavailable_archive_list_never_cancels_a_job() {
     .success());
     assert_eq!(state(h, job), "queued");
 }
+
+#[test]
+fn archived_managed_chat_drains_running_protected_work_before_next_job() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "manual");
+    let a = enqueue(h, &codex, "p", "archived-running", THREAD);
+    await_file(&h.join(format!("ready-{a}")));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_monohero"))
+        .arg("--home").arg(h).args(["run", &a.to_string(), "--thread", THREAD, "--", "/bin/sh", "-c", "touch protected-started; while [ ! -f release ]; do sleep 0.01; done; touch protected-finished"])
+        .current_dir(h).stdout(Stdio::null()).spawn().unwrap();
+    await_file(&h.join("protected-started"));
+    let b = submit(h, "p", "next", "test -f protected-finished");
+    fs::write(
+        h.join("fake-archived.json"),
+        serde_json::to_vec(&serde_json::json!([{"id": THREAD}])).unwrap(),
+    )
+    .unwrap();
+    assert!(cli(
+        h,
+        &["monitor", "--codex", codex.to_str().unwrap(), "--once"]
+    )
+    .status
+    .success());
+    assert_eq!(state(h, b), "queued");
+    fs::write(h.join("release"), "").unwrap();
+    assert!(child.wait().unwrap().success());
+    assert!(wait(h, b).status.success());
+    assert_eq!(state(h, a), "cancelled");
+}
