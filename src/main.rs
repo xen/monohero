@@ -1,6 +1,10 @@
 #![cfg(unix)]
 mod chat;
+mod dashboard;
+mod fence;
 mod goal;
+mod management;
+mod monitor;
 mod view;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
@@ -72,6 +76,17 @@ enum Action {
     Resolve { id: i64 },
     /// Cancel a queued job. Running jobs cannot be cancelled.
     Cancel { id: i64 },
+    #[command(flatten)]
+    Management(management::Actions),
+    /// Open the local queue dashboard.
+    Dashboard {
+        /// Start with only the macOS menu-bar icon.
+        #[arg(long)]
+        hidden: bool,
+        /// Explicit path to the separately installed GPUI Kit UI executable.
+        #[arg(long)]
+        ui: Option<PathBuf>,
+    },
     /// Print agent integration instructions.
     Guide,
     #[command(flatten)]
@@ -90,6 +105,10 @@ enum Request {
     Status {
         queue: Option<String>,
     },
+    Snapshot,
+    Manage {
+        action: management::Control,
+    },
     Wait {
         id: i64,
     },
@@ -100,7 +119,7 @@ enum Request {
         id: i64,
     },
 }
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Job {
     id: i64,
     queue: String,
@@ -112,11 +131,24 @@ struct Job {
     log: PathBuf,
     callback: Option<PathBuf>,
     callback_state: String,
+    #[serde(default)]
+    position: i64,
+    #[serde(default)]
+    archived: bool,
+    #[serde(default)]
+    parent_id: Option<i64>,
+    #[serde(default)]
+    hold_reason: Option<String>,
+    #[serde(default)]
+    pending_action: Option<String>,
+    #[serde(default)]
+    observation: Option<serde_json::Value>,
 }
 struct Shared {
     home: PathBuf,
     generation: Mutex<u64>,
     changed: Condvar,
+    monitor_started: Arc<std::sync::atomic::AtomicBool>,
 }
 fn db(home: &Path) -> Result<Connection> {
     let c = Connection::open(home.join("jobs.sqlite3"))?;
@@ -124,7 +156,7 @@ fn db(home: &Path) -> Result<Connection> {
     Ok(c)
 }
 fn jobs(c: &Connection) -> Result<Vec<Job>> {
-    let mut s = c.prepare("SELECT id,queue,key,cwd,command,state,exit_code,callback,callback_state FROM jobs ORDER BY id")?;
+    let mut s = c.prepare("SELECT id,queue,key,cwd,command,state,exit_code,callback,callback_state,position,archived,parent_id,hold_reason,pending_action,observation FROM jobs ORDER BY position,id")?;
     let rows = s.query_map([], |r| {
         Ok((
             r.get::<_, i64>(0)?,
@@ -136,10 +168,32 @@ fn jobs(c: &Connection) -> Result<Vec<Job>> {
             r.get::<_, Option<i32>>(6)?,
             r.get::<_, Option<String>>(7)?,
             r.get::<_, String>(8)?,
+            r.get::<_, i64>(9)?,
+            r.get::<_, bool>(10)?,
+            r.get::<_, Option<i64>>(11)?,
+            r.get::<_, Option<String>>(12)?,
+            r.get::<_, Option<String>>(13)?,
+            r.get::<_, Option<String>>(14)?,
         ))
     })?;
     rows.map(|row| {
-        let (id, queue, key, cwd, command, state, exit_code, callback, callback_state) = row?;
+        let (
+            id,
+            queue,
+            key,
+            cwd,
+            command,
+            state,
+            exit_code,
+            callback,
+            callback_state,
+            position,
+            archived,
+            parent_id,
+            hold_reason,
+            pending_action,
+            observation,
+        ) = row?;
         Ok(Job {
             id,
             queue,
@@ -151,6 +205,14 @@ fn jobs(c: &Connection) -> Result<Vec<Job>> {
             log: PathBuf::new(),
             callback: callback.map(Into::into),
             callback_state,
+            position,
+            archived,
+            parent_id,
+            hold_reason,
+            pending_action,
+            observation: observation
+                .map(|body| serde_json::from_str(&body))
+                .transpose()?,
         })
     })
     .collect()
@@ -158,7 +220,7 @@ fn jobs(c: &Connection) -> Result<Vec<Job>> {
 fn terminal(s: &str) -> bool {
     matches!(
         s,
-        "succeeded" | "failed" | "interrupted" | "cancelled" | "resolved"
+        "succeeded" | "failed" | "interrupted" | "cancelled" | "resolved" | "deferred" | "requeued"
     )
 }
 fn signal(s: &Shared) {
@@ -193,9 +255,13 @@ fn handle(r: Request, s: &Shared) -> Result<serde_json::Value> {
             {
                 bail!("callback must be an absolute existing executable path");
             }
+            c.execute(
+                "INSERT INTO queues(name) VALUES(?1) ON CONFLICT(name) DO UPDATE SET archived=0",
+                [&queue],
+            )?;
             let encoded = serde_json::to_string(&command)?;
             // Immutable deduplication key: a retry may not silently replace a workflow.
-            c.execute("INSERT INTO jobs(queue,key,cwd,command,state,callback,callback_state) VALUES(?1,?2,?3,?4,'queued',?5,'none') ON CONFLICT(queue,key) DO NOTHING",params![queue,key,cwd.to_str().context("non UTF-8 cwd")?,encoded,callback.as_ref().and_then(|p|p.to_str())])?;
+            c.execute("INSERT INTO jobs(queue,key,cwd,command,state,callback,callback_state,position) VALUES(?1,?2,?3,?4,'queued',?5,'none',(SELECT COALESCE(MAX(position),0)+1 FROM jobs WHERE queue=?1)) ON CONFLICT(queue,key) DO NOTHING",params![queue,key,cwd.to_str().context("non UTF-8 cwd")?,encoded,callback.as_ref().and_then(|p|p.to_str())])?;
             let j = jobs(&c)?
                 .into_iter()
                 .find(|j| j.queue == queue && j.key == key)
@@ -206,6 +272,8 @@ fn handle(r: Request, s: &Shared) -> Result<serde_json::Value> {
             signal(s);
             Ok(serde_json::json!({"id":j.id,"queue":queue,"state":j.state}))
         }
+        Request::Snapshot => management::snapshot(s),
+        Request::Manage { action } => management::apply(action, s),
         Request::Status { queue } => {
             let mut js = jobs(&c)?;
             js.retain(|j| queue.as_ref().map_or(true, |q| *q == j.queue));
@@ -267,8 +335,48 @@ fn execute(id: i64, s: &Shared, guard: &File) -> Result<()> {
             return Err(std::io::Error::last_os_error().into());
         }
     }
-    let status = Command::new(&j.command[0])
-        .args(&j.command[1..])
+    let mut command = j.command.clone();
+    // Operators may explicitly adopt queued workers from a known older installation.
+    // Preserve durable submission arguments and IDs, including saved goal wait keys.
+    if command.get(3).map(String::as_str) == Some("chat-worker") {
+        let adoptions: std::collections::BTreeMap<PathBuf, PathBuf> =
+            match fs::read(s.home.join("worker-adoptions.json")) {
+                Ok(body) => serde_json::from_slice(&body)?,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+                Err(e) => return Err(e.into()),
+            };
+        if let Some(target) = adoptions.get(&fs::canonicalize(&command[0])?) {
+            let argument = |name: &str| {
+                command[4..]
+                    .windows(2)
+                    .find(|pair| pair[0] == name)
+                    .map(|pair| pair[1].as_str())
+            };
+            if command[1] != "--home"
+                || fs::canonicalize(&command[2])? != fs::canonicalize(&s.home)?
+                || argument("--queue") != Some(j.queue.as_str())
+                || argument("--key") != Some(j.key.as_str())
+            {
+                anyhow::bail!("worker adoption refused: submitted native worker identity does not match its job");
+            }
+            command[0] = target
+                .to_str()
+                .context("worker executable is not UTF-8")?
+                .into();
+            if !command.iter().any(|arg| arg == "--managed-commands") {
+                command.push("--managed-commands".into());
+            }
+        }
+    }
+    // Future grants using this updated executable adopt fencing; persisted inputs stay immutable.
+    if command.get(3).map(String::as_str) == Some("chat-worker")
+        && !command.iter().any(|arg| arg == "--managed-commands")
+        && fs::canonicalize(&command[0])? == fs::canonicalize(std::env::current_exe()?)?
+    {
+        command.push("--managed-commands".into());
+    }
+    let status = Command::new(&command[0])
+        .args(&command[1..])
         .current_dir(&j.cwd)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
@@ -282,8 +390,12 @@ fn execute(id: i64, s: &Shared, guard: &File) -> Result<()> {
             ("failed", None)
         }
     };
+    if management::complete_release(&c, &s.home, id, code)? {
+        signal(s);
+        return Ok(());
+    }
     c.execute(
-        "UPDATE jobs SET state=?1,exit_code=?2 WHERE id=?3",
+        "UPDATE jobs SET state=?1,exit_code=?2,pending_action=NULL WHERE id=?3",
         params![state, code, id],
     )?;
     signal(s);
@@ -318,14 +430,23 @@ fn worker(queue: String, s: Arc<Shared>, guard: File) -> Result<()> {
         // One worker per queue. Transaction makes cancellation and claiming atomic.
         c.execute_batch("BEGIN IMMEDIATE")?;
         let js = jobs(&c)?;
-        let blocked = js
-            .iter()
-            .any(|j| j.queue == queue && matches!(j.state.as_str(), "failed" | "interrupted"));
-        let next = if blocked {
+        let blocked = js.iter().any(|j| {
+            j.queue == queue && !j.archived && matches!(j.state.as_str(), "failed" | "interrupted")
+        });
+        let paused: bool =
+            c.query_row("SELECT paused FROM queues WHERE name=?1", [&queue], |r| {
+                r.get(0)
+            })?;
+        let next = if blocked || paused {
             None
         } else {
             js.iter()
-                .find(|j| j.queue == queue && j.state == "queued")
+                .find(|j| {
+                    j.queue == queue
+                        && j.state == "queued"
+                        && j.hold_reason.is_none()
+                        && !j.archived
+                })
                 .map(|j| j.id)
         };
         if let Some(id) = next {
@@ -359,8 +480,19 @@ fn serve(home: PathBuf) -> Result<()> {
     guard
         .try_lock_exclusive()
         .context("daemon or surviving job already owns this home")?;
+    let active_work = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .open(home.join("active-work.lock"))?;
+    active_work
+        .try_lock_exclusive()
+        .context("protected children still own this home; do not restart over them")?;
     let c = db(&home)?;
     c.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,queue TEXT NOT NULL,key TEXT NOT NULL,cwd TEXT NOT NULL,command TEXT NOT NULL,state TEXT NOT NULL,exit_code INTEGER,callback TEXT,callback_state TEXT NOT NULL,UNIQUE(queue,key)); UPDATE jobs SET state='interrupted' WHERE state='running'; UPDATE jobs SET callback_state='interrupted' WHERE callback_state='running';")?;
+    management::migrate(&c)?;
     let socket = home.join("control.sock");
     if socket.exists() {
         fs::remove_file(&socket)?;
@@ -371,6 +503,7 @@ fn serve(home: PathBuf) -> Result<()> {
         home,
         generation: Mutex::new(0),
         changed: Condvar::new(),
+        monitor_started: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     let workers = Arc::new(Mutex::new(HashSet::<String>::new()));
     // Manager sleeps on committed submission/completion events, never a timer.
@@ -381,7 +514,10 @@ fn serve(home: PathBuf) -> Result<()> {
         let result = (|| -> Result<()> {
             let mut generation = manager_s.generation.lock().unwrap();
             loop {
-                for j in jobs(&db(&manager_s.home)?)? {
+                for j in jobs(&db(&manager_s.home)?)?
+                    .into_iter()
+                    .filter(|job| !job.archived)
+                {
                     if manager_workers.lock().unwrap().insert(j.queue.clone()) {
                         let shared = manager_s.clone();
                         let g = manager_guard.try_clone()?;
@@ -401,6 +537,8 @@ fn serve(home: PathBuf) -> Result<()> {
             std::process::exit(1);
         }
     });
+    FileExt::unlock(&active_work)?;
+    monitor::start_configured(&s.home, s.monitor_started.clone())?;
     eprintln!("monohero ready: {}", socket.display());
     for stream in listener.incoming() {
         let mut stream = stream?;
@@ -439,6 +577,8 @@ fn main() -> Result<()> {
     let request = match cli.command {
         Action::Serve => return serve(home),
         Action::Chat(action) => return chat::run(action, &home),
+        Action::Management(action) => return management::run(action, &home),
+        Action::Dashboard { hidden, ui } => return dashboard::launch(&home, hidden, ui),
         Action::Queue { queue, all, json } => return view::show(&home, queue, all, json),
         Action::Submit {
             queue,
@@ -456,7 +596,9 @@ fn main() -> Result<()> {
         Action::Status { queue } => Request::Status { queue },
         Action::Wait { id } => Request::Wait { id },
         Action::Resolve { id } => Request::Resolve { id },
-        Action::Cancel { id } => Request::Cancel { id },
+        Action::Cancel { id } => Request::Manage {
+            action: management::Control::Cancel { id },
+        },
         Action::Guide => unreachable!(),
     };
     let waiting = matches!(request, Request::Wait { .. });
@@ -472,6 +614,9 @@ fn call(home: &Path, request: &Request) -> Result<serde_json::Value> {
     let mut stream = UnixStream::connect(home.join("control.sock"))
         .context("cannot reach Monohero; start `monohero serve` with the same --home")?;
     writeln!(stream, "{}", serde_json::to_string(request)?)?;
+    if !matches!(request, Request::Wait { .. }) {
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+    }
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
     let response: serde_json::Value = serde_json::from_str(&line)

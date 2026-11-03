@@ -192,6 +192,11 @@ fn transport_acceptance_alone_is_not_a_claim() {
     let codex = stub(h, "unclaimed");
     let a = enqueue(h, &codex, "p", "a", THREAD);
     await_file(&h.join(format!("ready-{a}")));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while receipt(h, a)["state"] != "message_queued" {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
     assert_eq!(receipt(h, a)["state"], "message_queued");
     assert!(!cli(h, &["finish", &a.to_string(), "--thread", THREAD])
         .status
@@ -318,7 +323,7 @@ fn goal_stub(home: &Path, mode: &str) -> std::path::PathBuf {
     let script = fs::read_to_string(&path).unwrap();
     let insert = format!(
         r#"
-if sys.argv[1:]==['app-server','--stdio']:
+if sys.argv[1:] in [['app-server','--stdio'],['app-server','proxy']]:
  home=pathlib.Path({home:?});p=home/'fake-goal.json'
  for line in sys.stdin:
   row=json.loads(line)
@@ -330,6 +335,13 @@ if sys.argv[1:]==['app-server','--stdio']:
   if method=='thread/goal/get':result={{'goal':json.loads(p.read_text())}}
   elif method=='thread/goal/set':
    goal=json.loads(p.read_text());goal['status']=row['params']['status'];goal['updatedAt']+=1;p.write_text(json.dumps(goal));result={{'goal':goal}}
+  elif method=='thread/read':
+   status=json.loads((home/'fake-runtime.json').read_text()) if (home/'fake-runtime.json').exists() else {{'type':'notLoaded'}}
+   result={{'thread':{{'id':row['params']['threadId'],'status':status}}}}
+  elif method=='thread/turns/list':
+   assert row['params']['limit']==1 and row['params']['itemsView']=='summary'
+   result={{'data':[]}}
+  elif method=='thread/queue/list':result={{'data':[],'nextCursor':None}}
   elif method!='initialize':raise RuntimeError(method)
   print(json.dumps({{'id':row['id'],'result':result}}),flush=True)
  sys.exit(0)
@@ -597,4 +609,404 @@ fn failed_native_wake_preserves_accepted_message_and_failure_barrier_without_ret
     assert!(!cli(h, &["configure-wake", "--opener", "relative-opener"])
         .status
         .success());
+}
+
+fn manage(home: &Path, action: Value) -> Value {
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::net::UnixStream,
+    };
+    let mut stream = UnixStream::connect(home.join("control.sock")).unwrap();
+    writeln!(
+        stream,
+        "{}",
+        serde_json::json!({"op":"Manage","action":action})
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    serde_json::from_str(&line).unwrap()
+}
+fn observation(state: &str) -> Value {
+    serde_json::json!({"thread_id":THREAD,"state":state,"source":"codex-runtime","reason":"Needs a human answer","authoritative":true,"observed_at":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()})
+}
+#[test]
+fn both_blocked_policies_skip_pending_chats_without_repeated_dispatch() {
+    for policy in ["attention", "tail"] {
+        let s = server();
+        let h = s.home.path();
+        let codex = stub(h, "auto");
+        json(h, &["policy", "--queue", "p", "--blocked", policy]);
+        json(h, &["pause-queue", "p"]);
+        let a = enqueue(h, &codex, "p", "needs-input", THREAD);
+        let b = submit(h, "p", "ready", "true");
+        assert_eq!(
+            manage(
+                h,
+                serde_json::json!({"type":"observe","id":a,"observation":observation("needs_input")})
+            )["ok"],
+            true
+        );
+        json(h, &["resume-queue", "p"]);
+        assert!(wait(h, b).status.success());
+        assert!(!h.join(format!("trace-{a}.json")).exists());
+        if policy == "attention" {
+            assert_eq!(state(h, a), "deferred");
+            let resumed = json(h, &["resume", &a.to_string()])["new_job"]
+                .as_i64()
+                .unwrap();
+            assert!(wait(h, resumed).status.success());
+        } else {
+            assert_eq!(state(h, a), "queued");
+            assert_eq!(
+                manage(
+                    h,
+                    serde_json::json!({"type":"observe","id":a,"observation":observation("idle")})
+                )["ok"],
+                true
+            );
+            assert!(wait(h, a).status.success());
+        }
+    }
+}
+#[test]
+fn managed_deferral_drains_protected_commands_and_rejects_stale_grants() {
+    let s = server();
+    let h = s.home.path();
+    let codex = stub(h, "manual");
+    let a = enqueue(h, &codex, "p", "managed", THREAD);
+    await_file(&h.join(format!("ready-{a}")));
+    let mut command=Command::new(env!("CARGO_BIN_EXE_monohero")).arg("--home").arg(h).args(["run",&a.to_string(),"--thread",THREAD,"--","/bin/sh","-c","touch protected-started; while [ ! -f release ]; do sleep 0.01; done; touch protected-finished"]).current_dir(h).stdout(Stdio::null()).spawn().unwrap();
+    await_file(&h.join("protected-started"));
+    assert!(!cli(h, &["finish", &a.to_string(), "--thread", THREAD])
+        .status
+        .success());
+    assert_eq!(state(h, a), "running");
+    let b = submit(
+        h,
+        "p",
+        "next",
+        "test -f protected-finished; touch next-started",
+    );
+    json(
+        h,
+        &["defer", &a.to_string(), "--reason", "Needs user input"],
+    );
+    assert_eq!(state(h, b), "queued");
+    assert!(!cli(
+        h,
+        &[
+            "run",
+            &a.to_string(),
+            "--thread",
+            THREAD,
+            "--",
+            "/usr/bin/true"
+        ]
+    )
+    .status
+    .success());
+    fs::write(h.join("release"), "").unwrap();
+    assert!(command.wait().unwrap().success());
+    assert!(wait(h, b).status.success());
+    assert_eq!(state(h, a), "deferred");
+    assert!(!cli(h, &["claim", &a.to_string(), "--thread", THREAD])
+        .status
+        .success());
+    let resumed = json(h, &["resume", &a.to_string()])["new_job"]
+        .as_i64()
+        .unwrap();
+    await_file(&h.join(format!("ready-{resumed}")));
+    assert_ne!(a, resumed);
+    finish(h, resumed);
+    assert!(wait(h, resumed).status.success());
+}
+#[test]
+fn stale_or_unknown_status_never_revokes_a_claimed_grant() {
+    let s = server();
+    let h = s.home.path();
+    let codex = stub(h, "manual");
+    let a = enqueue(h, &codex, "p", "status-unknown", THREAD);
+    await_file(&h.join(format!("ready-{a}")));
+    let mut stale = observation("needs_input");
+    stale["observed_at"] = serde_json::json!(1);
+    assert_eq!(
+        manage(
+            h,
+            serde_json::json!({"type":"observe","id":a,"observation":stale})
+        )["ok"],
+        false
+    );
+    let mut unknown = observation("unknown");
+    unknown["authoritative"] = serde_json::json!(false);
+    assert_eq!(
+        manage(
+            h,
+            serde_json::json!({"type":"observe","id":a,"observation":unknown})
+        )["ok"],
+        true
+    );
+    assert_eq!(state(h, a), "running");
+    assert_eq!(receipt(h, a)["state"], "claimed");
+    finish(h, a);
+}
+
+#[test]
+fn failed_protected_command_requires_owner_inspection_before_yield() {
+    let s = server();
+    let h = s.home.path();
+    let codex = stub(h, "manual");
+    let a = enqueue(h, &codex, "p", "failed-protected", THREAD);
+    await_file(&h.join(format!("ready-{a}")));
+    assert!(!cli(
+        h,
+        &[
+            "run",
+            &a.to_string(),
+            "--thread",
+            THREAD,
+            "--",
+            "/usr/bin/false"
+        ]
+    )
+    .status
+    .success());
+    assert!(!cli(h, &["finish", &a.to_string(), "--thread", THREAD])
+        .status
+        .success());
+    json(
+        h,
+        &["defer", &a.to_string(), "--reason", "Waiting for input"],
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let jobs = json(h, &["status"]);
+        let job = jobs
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|j| j["id"] == a)
+            .unwrap();
+        if job["pending_action"].is_null()
+            && job["hold_reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("protected command failed"))
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(state(h, a), "running");
+    json(
+        h,
+        &[
+            "defer",
+            &a.to_string(),
+            "--thread",
+            THREAD,
+            "--reason",
+            "Owner inspected failed command effects",
+        ],
+    );
+    await_state(h, a, "deferred");
+}
+
+#[test]
+fn deferred_goal_wait_restores_original_identity_after_new_grant() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "manual");
+    json(h, &["policy", "--queue", "p", "--blocked", "attention"]);
+    json(h, &["pause-queue", "p"]);
+    let original = read_goal(h);
+    let a = parked_enqueue(h, &codex, "park-defer");
+    json(
+        h,
+        &["defer", &a.to_string(), "--reason", "Owner needs input"],
+    );
+    let resumed = json(h, &["resume", &a.to_string()])["new_job"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(read_goal(h)["status"], "paused");
+    json(h, &["resume-queue", "p"]);
+    await_file(&h.join(format!("ready-{resumed}")));
+    let restored = read_goal(h);
+    assert_eq!(restored["status"], "active");
+    for field in [
+        "objective",
+        "tokenBudget",
+        "tokensUsed",
+        "timeUsedSeconds",
+        "createdAt",
+    ] {
+        assert_eq!(restored[field], original[field]);
+    }
+    finish(h, resumed);
+    assert!(wait(h, resumed).status.success());
+    assert_eq!(state(h, a), "requeued");
+    let calls = fs::read_to_string(h.join("goal-rpc.log")).unwrap();
+    assert_eq!(calls.lines().filter(|l| *l == "thread/goal/set").count(), 2);
+}
+
+#[test]
+fn configured_native_monitor_defers_input_wait_and_continues_next_job() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "manual");
+    let a = enqueue(h, &codex, "p", "monitor-input", THREAD);
+    await_file(&h.join(format!("ready-{a}")));
+    let b = submit(h, "p", "after-input", "touch next-after-monitor");
+    fs::write(
+        h.join("fake-runtime.json"),
+        r#"{"type":"active","activeFlags":["waitingOnUserInput"]}"#,
+    )
+    .unwrap();
+    json(
+        h,
+        &[
+            "configure-monitor",
+            "--codex",
+            codex.to_str().unwrap(),
+            "--proxy",
+            "--interval",
+            "5",
+        ],
+    );
+    assert!(wait(h, b).status.success());
+    assert_eq!(state(h, a), "deferred");
+    assert!(h.join("next-after-monitor").exists());
+    let data = json(h, &["inspect"]);
+    let job = data["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["id"] == a)
+        .unwrap();
+    assert_eq!(job["observation"]["state"], "needs_input");
+    assert_eq!(job["observation"]["source"], "codex-runtime");
+    assert!(!h.join(format!("trace-{}.json", a + 2)).exists());
+}
+
+#[test]
+fn legacy_claim_requires_owner_yield_even_with_live_blocked_status() {
+    let s = server();
+    let h = s.home.path();
+    let codex = stub(h, "manual");
+    let legacy = h.join("legacy-monohero");
+    fs::copy(env!("CARGO_BIN_EXE_monohero"), &legacy).unwrap();
+    let a = json(
+        h,
+        &[
+            "submit",
+            "--queue",
+            "p",
+            "--key",
+            "legacy",
+            "--cwd",
+            h.to_str().unwrap(),
+            "--",
+            legacy.to_str().unwrap(),
+            "--home",
+            h.to_str().unwrap(),
+            "chat-worker",
+            "--queue",
+            "p",
+            "--key",
+            "legacy",
+            "--thread",
+            THREAD,
+            "--codex",
+            codex.to_str().unwrap(),
+            "--message",
+            "Continue already authorized work",
+        ],
+    )["id"]
+        .as_i64()
+        .unwrap();
+    await_file(&h.join(format!("ready-{a}")));
+    assert_eq!(receipt(h, a)["managed"], false);
+    assert_eq!(
+        manage(
+            h,
+            serde_json::json!({"type":"observe","id":a,"observation":observation("needs_input")})
+        )["ok"],
+        true
+    );
+    assert_eq!(state(h, a), "running");
+    assert!(
+        !cli(h, &["defer", &a.to_string(), "--reason", "Needs input"])
+            .status
+            .success()
+    );
+    json(
+        h,
+        &[
+            "defer",
+            &a.to_string(),
+            "--thread",
+            THREAD,
+            "--reason",
+            "Owner stopped all legacy protected work",
+        ],
+    );
+    await_state(h, a, "deferred");
+}
+
+#[test]
+fn explicit_worker_adoption_preserves_queued_identity_and_submitted_arguments() {
+    let s = server();
+    let h = s.home.path();
+    let codex = stub(h, "manual");
+    let legacy = h.join("old-worker");
+    fs::copy(env!("CARGO_BIN_EXE_monohero"), &legacy).unwrap();
+    json(h, &["policy", "--queue", "p", "--blocked", "attention"]);
+    json(h, &["pause-queue", "p"]);
+    let args = [
+        "submit",
+        "--queue",
+        "p",
+        "--key",
+        "old-pending",
+        "--cwd",
+        h.to_str().unwrap(),
+        "--",
+        legacy.to_str().unwrap(),
+        "--home",
+        h.to_str().unwrap(),
+        "chat-worker",
+        "--queue",
+        "p",
+        "--key",
+        "old-pending",
+        "--thread",
+        THREAD,
+        "--codex",
+        codex.to_str().unwrap(),
+        "--message",
+        "Continue authorized work",
+    ];
+    let a = json(h, &args)["id"].as_i64().unwrap();
+    let before = json(h, &["status"]);
+    json(h, &["adopt-workers", "--from", legacy.to_str().unwrap()]);
+    assert_eq!(before, json(h, &["status"]));
+    assert_eq!(json(h, &args)["id"], a);
+    json(h, &["resume-queue", "p"]);
+    await_file(&h.join(format!("ready-{a}")));
+    assert_eq!(receipt(h, a)["managed"], true);
+    assert!(cli(
+        h,
+        &[
+            "run",
+            &a.to_string(),
+            "--thread",
+            THREAD,
+            "--",
+            "/usr/bin/true"
+        ]
+    )
+    .status
+    .success());
+    finish(h, a);
+    assert!(wait(h, a).status.success());
 }

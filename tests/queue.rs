@@ -306,3 +306,121 @@ fn readable_queue_preserves_barriers_fifo_and_project_isolation() {
     let history = json(home, &["queue", "--queue", "project-b", "--all", "--json"]);
     assert_eq!(history[0]["id"], other);
 }
+
+#[test]
+fn manual_order_and_pause_survive_restart_and_reject_stale_lists() {
+    let mut s = server();
+    let h = s.home.path();
+    json(
+        h,
+        &["policy", "--queue", "ordered", "--blocked", "attention"],
+    );
+    json(h, &["pause-queue", "ordered"]);
+    let a = submit(h, "ordered", "a", "echo a >> order");
+    let b = submit(h, "ordered", "b", "echo b >> order");
+    let c = submit(h, "ordered", "c", "echo c >> order");
+    json(
+        h,
+        &[
+            "reorder",
+            "--queue",
+            "ordered",
+            "--ids",
+            &format!("{c},{a},{b}"),
+        ],
+    );
+    let d = submit(h, "ordered", "d", "echo d >> order");
+    assert!(!cli(
+        h,
+        &[
+            "reorder",
+            "--queue",
+            "ordered",
+            "--ids",
+            &format!("{c},{a},{b}")
+        ]
+    )
+    .status
+    .success());
+    s.child.kill().unwrap();
+    s.child.wait().unwrap();
+    s.child = start(h);
+    let snapshot = json(h, &["inspect"]);
+    assert_eq!(snapshot["queues"][0]["paused"], true);
+    let order: Vec<i64> = snapshot["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|job| job["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(order, vec![c, a, b, d]);
+    json(h, &["resume-queue", "ordered"]);
+    assert!(wait(h, d).status.success());
+    assert_eq!(fs::read_to_string(h.join("order")).unwrap(), "c\na\nb\nd\n");
+}
+
+#[test]
+fn deferred_resume_uses_new_identity_and_clear_preserves_deduplication() {
+    let s = server();
+    let h = s.home.path();
+    json(h, &["policy", "--queue", "p", "--blocked", "attention"]);
+    json(h, &["pause-queue", "p"]);
+    let a = submit(h, "p", "original", "echo executed > effect");
+    json(h, &["defer", &a.to_string(), "--reason", "Needs input"]);
+    let resumed = json(h, &["resume", &a.to_string()])["new_job"]
+        .as_i64()
+        .unwrap();
+    assert_ne!(a, resumed);
+    assert_eq!(submit(h, "p", "original", "echo executed > effect"), a);
+    let snapshot = json(h, &["inspect"]);
+    assert_eq!(snapshot["jobs"][0]["parent_id"], a);
+    assert!(snapshot["jobs"][0].get("command").is_none());
+    json(h, &["clear", "--queue", "p", "--delete"]);
+    assert!(json(h, &["inspect"])["queues"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_eq!(submit(h, "p", "original", "echo executed > effect"), a);
+    assert!(!h.join("effect").exists());
+    assert!(json(h, &["status"])
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|job| job["id"] == resumed && job["state"] == "cancelled"));
+}
+
+#[test]
+fn clear_rejects_active_work_and_uninspected_failure_barriers() {
+    let s = server();
+    let h = s.home.path();
+    let failed = submit(h, "p", "failure", "exit 8");
+    assert!(!wait(h, failed).status.success());
+    assert!(!cli(h, &["clear", "--queue", "p"]).status.success());
+    json(h, &["clear", "--queue", "p", "--acknowledge-failures"]);
+    assert_eq!(json(h, &["status"])[0]["state"], "resolved");
+    let running = submit(
+        h,
+        "p",
+        "busy",
+        "touch started; while [ ! -f release ]; do sleep 0.01; done",
+    );
+    let end = Instant::now() + Duration::from_secs(10);
+    while !h.join("started").exists() {
+        assert!(Instant::now() < end);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!cli(
+        h,
+        &[
+            "clear",
+            "--queue",
+            "p",
+            "--delete",
+            "--acknowledge-failures"
+        ]
+    )
+    .status
+    .success());
+    fs::write(h.join("release"), "").unwrap();
+    assert!(wait(h, running).status.success());
+}

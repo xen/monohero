@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-struct Rpc {
+pub(crate) struct Rpc {
     child: Child,
     lines: mpsc::Receiver<std::io::Result<String>>,
     id: u64,
@@ -25,9 +25,23 @@ impl Drop for Rpc {
     }
 }
 impl Rpc {
-    fn start(codex: &Path) -> Result<Self> {
-        let mut child = Command::new(codex)
-            .args(["app-server", "--stdio"])
+    pub(crate) fn start(codex: &Path) -> Result<Self> {
+        Self::connect(codex, false, None)
+    }
+    pub(crate) fn connect(codex: &Path, proxy: bool, socket: Option<&Path>) -> Result<Self> {
+        let mut command = Command::new(codex);
+        command.args(if proxy {
+            vec!["app-server", "proxy"]
+        } else {
+            vec!["app-server", "--stdio"]
+        });
+        if let Some(socket) = socket {
+            if !proxy {
+                bail!("a control socket requires explicit proxy mode");
+            }
+            command.arg("--sock").arg(socket);
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -54,7 +68,7 @@ impl Rpc {
         )?;
         Ok(rpc)
     }
-    fn request(&mut self, method: &str, params: Value) -> Result<Value> {
+    pub(crate) fn request(&mut self, method: &str, params: Value) -> Result<Value> {
         self.id += 1;
         let stdin = self.child.stdin.as_mut().context("missing RPC input")?;
         writeln!(

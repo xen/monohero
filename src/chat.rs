@@ -93,6 +93,10 @@ pub enum Actions {
         /// Explicitly authorize pausing this active goal until its queued grant.
         #[arg(long)]
         park_goal: bool,
+        #[arg(long)]
+        managed_commands: bool,
+        #[arg(long)]
+        goal_key: Option<String>,
     },
     #[command(hide = true)]
     NotifyWorker {
@@ -116,6 +120,8 @@ struct Receipt {
     error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     app_wake: Option<String>,
+    #[serde(default)]
+    managed: bool,
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -140,7 +146,7 @@ fn validate_thread(id: &str) -> Result<()> {
 fn text(path: &Path) -> Result<String> {
     Ok(path.to_str().context("non UTF-8 path")?.to_owned())
 }
-fn executable(path: &Path) -> Result<PathBuf> {
+pub(crate) fn executable(path: &Path) -> Result<PathBuf> {
     let found = if path.components().count() > 1 || path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -270,6 +276,7 @@ pub fn run(action: Actions, home: &Path) -> Result<()> {
                     message,
                 ],
             )?;
+            command.push("--managed-commands".into());
             if park_goal {
                 command.push("--park-goal".into());
                 let existing = call(
@@ -363,10 +370,15 @@ pub fn run(action: Actions, home: &Path) -> Result<()> {
             codex,
             message,
             park_goal,
+            managed_commands,
+            goal_key,
         } => {
             let job = running_job(home, &queue, &key)?;
             let id = job["id"].as_i64().context("missing job ID")?;
-            let prompt=format!("Monohero: your turn in queue {queue}. Job {id}; worktree {}. The human owner authorized this existing chat to continue: {message}\nFirst confirm receipt using:\n{}\nIf claim fails, stop without doing protected work. Then complete the already-authorized protected work, preserving project approvals/checks/review/deploy/verification. Do not poll or enqueue recursively. After ALL protected work, execute:\n{}\nOn failure/blocker append --failed and explain. Do no protected work after finish. Acknowledging the grant alone is not completion.",job["cwd"].as_str().unwrap_or(""),control(home,"claim",id,&thread)?,control(home,"finish",id,&thread)?);
+            let mut prompt=format!("Monohero: your turn in queue {queue}. Job {id}; worktree {}. The human owner authorized this existing chat to continue: {message}\nFirst confirm receipt using:\n{}\nIf claim fails, stop without doing protected work. Then complete the already-authorized protected work, preserving project approvals/checks/review/deploy/verification. Do not poll or enqueue recursively. After ALL protected work, execute:\n{}\nOn failure/blocker append --failed and explain. Do no protected work after finish. Acknowledging the grant alone is not completion.",job["cwd"].as_str().unwrap_or(""),control(home,"claim",id,&thread)?,control(home,"finish",id,&thread)?);
+            if managed_commands {
+                prompt.push_str(&format!("\nThis is a managed, revocable grant. Run EVERY protected shell/Git/test/push/review/merge/deploy command through `{} --home {} run {id} --thread {thread} -- COMMAND ARGS`. Use command-line tools for protected mutations so the lease lock covers the complete action. Wait for all protected children. Before asking the human for input, yield safely with `{} --home {} defer {id} --thread {thread} --reason REASON` and stop protected work. The native monitor may revoke blocked managed grants after protected children drain. Never continue protected work after revocation or use a stale invitation; explicitly resume as a new queue entry. Failed lease validation requires stopping, not bypassing the wrapper.",text(&std::env::current_exe()?)?,text(home)?,text(&std::env::current_exe()?)?,text(home)?));
+            }
             receive(
                 home,
                 id,
@@ -374,7 +386,11 @@ pub fn run(action: Actions, home: &Path) -> Result<()> {
                 "lease",
                 &codex,
                 &prompt,
-                park_goal.then_some((queue.as_str(), key.as_str())),
+                (
+                    park_goal
+                        .then_some((queue.as_str(), goal_key.as_deref().unwrap_or(key.as_str()))),
+                    managed_commands,
+                ),
             )
         }
         Actions::NotifyWorker { id, thread, codex } => {
@@ -382,7 +398,15 @@ pub fn run(action: Actions, home: &Path) -> Result<()> {
             let notice = job["id"].as_i64().context("missing notification job ID")?;
             let result = call(home, &Request::Wait { id })?;
             let prompt=format!("Monohero completion notice for job {id}; notification {notice}. The human owner authorized this existing chat to resume. First confirm receipt:\n{}\nActual job result:\n{}\nRead the saved evidence and report the outcome. Continue only already-authorized follow-up work. This notice grants NO release slot: new protected work must rejoin its project queue. Do not retry failed deployment automatically.",control(home,"acknowledge",notice,&thread)?,serde_json::to_string_pretty(&result)?);
-            receive(home, notice, &thread, "notice", &codex, &prompt, None)
+            receive(
+                home,
+                notice,
+                &thread,
+                "notice",
+                &codex,
+                &prompt,
+                (None, false),
+            )
         }
     }
 }
@@ -414,8 +438,9 @@ fn receive(
     kind: &str,
     codex: &Path,
     prompt: &str,
-    parked_goal: Option<(&str, &str)>,
+    policy: (Option<(&str, &str)>, bool),
 ) -> Result<()> {
+    let (parked_goal, managed) = policy;
     validate_thread(thread)?;
     let dir = private_dir(home)?;
     let socket = dir.join(format!("{id}.sock"));
@@ -435,6 +460,7 @@ fn receive(
         finish_requested: None,
         error: None,
         app_wake: None,
+        managed,
     };
     persist(&path, &mut r)?;
     let lock = OpenOptions::new()
@@ -496,6 +522,16 @@ fn receive(
             }
             match value["op"].as_str() {
                 Some("claim") if kind == "lease" => {
+                    let status = call(home, &Request::Status { queue: None })?;
+                    let current = status
+                        .as_array()
+                        .context("invalid job list")?
+                        .iter()
+                        .find(|job| job["id"] == id)
+                        .context("unknown job")?;
+                    if current["state"] != "running" || !current["pending_action"].is_null() {
+                        bail!("grant no longer available; do not start protected work");
+                    }
                     r.claimed_at.get_or_insert_with(now);
                     r.state = "claimed".into();
                     persist(&path, &mut r)?;
@@ -508,8 +544,29 @@ fn receive(
                     let failed = value["failed"]
                         .as_bool()
                         .context("failed must be boolean")?;
+                    if managed && !failed && crate::fence::has_failure(home, id) {
+                        bail!("a protected command failed; inspect effects and finish --failed or explicitly yield");
+                    }
+                    let _resource = if managed {
+                        Some(crate::fence::finish_guard(home, id)?)
+                    } else {
+                        None
+                    };
                     r.finish_requested = Some(failed);
                     r.state = if failed { "failed" } else { "completed" }.into();
+                    persist(&path, &mut r)?;
+                    Ok(true)
+                }
+                Some(op @ ("defer" | "cancel")) if kind == "lease" => {
+                    if r.claimed_at.is_some() && !managed && value["owner_yield"] != true {
+                        bail!("legacy claimed work must be yielded by its owner");
+                    }
+                    r.state = if op == "defer" {
+                        "deferred"
+                    } else {
+                        "cancelled"
+                    }
+                    .into();
                     persist(&path, &mut r)?;
                     Ok(true)
                 }
@@ -526,6 +583,18 @@ fn receive(
             Ok(done) => {
                 writeln!(stream, "{}", json!({"ok":true,"state":r.state}))?;
                 if done {
+                    if r.claimed_at.is_none()
+                        && matches!(r.state.as_str(), "deferred" | "cancelled")
+                    {
+                        if let Some(message) = r.message_id.as_deref() {
+                            if let Err(error) =
+                                crate::monitor::remove_pending(codex, thread, message)
+                            {
+                                r.error=Some(format!("Grant revoked, but old queued message could not be withdrawn: {error:#}. A stale claim remains invalid."));
+                                persist(&path, &mut r)?;
+                            }
+                        }
+                    }
                     if r.finish_requested == Some(true) {
                         bail!("owner finished with failure; inspect its report");
                     }
@@ -604,4 +673,28 @@ fn wake_app(home: &Path, thread: &str, id: i64, path: &Path, receipt: &mut Recei
     }
     receipt.app_wake = Some("requested".into());
     persist(path, receipt)
+}
+
+pub fn revoke(
+    home: &Path,
+    id: i64,
+    thread: &str,
+    operation: &str,
+    owner_yield: bool,
+) -> Result<()> {
+    let mut stream = UnixStream::connect(home.join("chats").join(format!("{id}.sock")))
+        .context("no live grant receiver")?;
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    writeln!(
+        stream,
+        "{}",
+        json!({"thread":thread,"op":operation,"owner_yield":owner_yield})
+    )?;
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line)?;
+    let value: Value = serde_json::from_str(&line)?;
+    if value["ok"] != true {
+        bail!("{}", value["error"]);
+    }
+    Ok(())
 }

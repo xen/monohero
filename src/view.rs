@@ -6,15 +6,15 @@ use std::{collections::BTreeMap, fmt::Write, path::Path};
 fn visible(job: &Job) -> bool {
     matches!(
         job.state.as_str(),
-        "queued" | "running" | "failed" | "interrupted"
+        "queued" | "running" | "failed" | "interrupted" | "deferred"
     ) || matches!(job.callback_state.as_str(), "running" | "failed")
 }
 
 pub fn show(home: &Path, queue: Option<String>, all: bool, json: bool) -> Result<()> {
     let data = call(home, &Request::Status { queue })?;
     let mut jobs: Vec<Job> = serde_json::from_value(data)?;
-    jobs.sort_by_key(|job| job.id);
-    jobs.retain(|job| all || visible(job));
+    jobs.sort_by_key(|job| (job.position, job.id));
+    jobs.retain(|job| all || (!job.archived && visible(job)));
     if json {
         println!("{}", serde_json::to_string_pretty(&jobs)?);
     } else {
@@ -56,6 +56,9 @@ fn render(jobs: &[Job]) -> String {
                 job.state.clone()
             };
             writeln!(output, "  #{:<5} {:<14} {}", job.id, label, job.key).unwrap();
+            if let Some(reason) = &job.hold_reason {
+                writeln!(output, "         attention: {reason}").unwrap();
+            }
             writeln!(output, "         cwd: {}", job.cwd.display()).unwrap();
             if let Some(worker) = job
                 .command
