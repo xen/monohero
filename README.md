@@ -196,3 +196,18 @@ uncertain lifecycle changes stop for inspection. A cancelled/failed job leaves
 its goal paused until explicit `unpark-goal`. Without this opt-in, goals are
 unchanged and may continue independent work. See [goal lifecycle and recovery](integrations/AGENT.md#existing-goals-while-waiting), including host timestamp
 requirements and the public API's lack of atomic compare-and-set revisions.
+
+## View queues
+
+```sh
+monohero queue                            # unfinished jobs in every queue
+monohero queue --queue my-project-release # one project's FIFO queue
+monohero queue --all                      # include completed history
+monohero queue --queue my-project-release --json
+```
+
+The readable snapshot shows the current job, waiting positions, failure barriers,
+worktree directories and destination chat IDs. Positions are per queue; different
+projects remain independent. Failed/interrupted jobs explicitly show why a queue
+cannot advance. Viewing never claims, resolves or retries a job. It reads once
+and exits; there is no automatic refresh. `status` retains its existing JSON format.

@@ -1,6 +1,7 @@
 #![cfg(unix)]
 mod chat;
 mod goal;
+mod view;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
@@ -52,6 +53,18 @@ enum Action {
     Status {
         #[arg(long)]
         queue: Option<String>,
+    },
+    /// Show queues in FIFO order as a readable, one-time snapshot.
+    Queue {
+        /// Show only this project's queue.
+        #[arg(long)]
+        queue: Option<String>,
+        /// Include completed, cancelled and resolved jobs.
+        #[arg(long)]
+        all: bool,
+        /// Print the selected jobs as JSON instead of text.
+        #[arg(long)]
+        json: bool,
     },
     /// Block on a socket until a job reaches a terminal state.
     Wait { id: i64 },
@@ -426,6 +439,7 @@ fn main() -> Result<()> {
     let request = match cli.command {
         Action::Serve => return serve(home),
         Action::Chat(action) => return chat::run(action, &home),
+        Action::Queue { queue, all, json } => return view::show(&home, queue, all, json),
         Action::Submit {
             queue,
             key,

@@ -123,3 +123,11 @@ resumption is not implemented. Monohero serializes cooperating work on one local
 host; commands outside it are not protected. Waiting/dispatch use no LLM; the
 resumed destination chat consumes tokens for its authorized work. No hooks,
 permission bypasses, new sessions or coordinator agents are installed implicitly.
+
+## Inspect queues manually
+
+Use `monohero queue` for a readable snapshot of all unfinished queues, or
+`monohero queue --queue PROJECT-RESOURCE` for one project. It shows FIFO waiting
+positions, running jobs, blocked jobs, worktrees and destination chat IDs.
+`--all` includes history; `--json` returns structured selected jobs. It exits
+after one read. Do not turn this command into a model polling loop.

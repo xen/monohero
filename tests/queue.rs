@@ -264,3 +264,45 @@ fn worktrees_share_queue_but_keep_their_own_working_directories() {
         );
     }
 }
+
+#[test]
+fn readable_queue_preserves_barriers_fifo_and_project_isolation() {
+    let server = server();
+    let home = server.home.path();
+    let failed = submit(home, "project-a", "failed-release", "exit 9");
+    assert!(!wait(home, failed).status.success());
+    let first = submit(home, "project-a", "first-waiter", "exit 0");
+    let second = submit(home, "project-a", "second-waiter", "exit 0");
+    let other = submit(home, "project-b", "other-project", "exit 0");
+    assert!(wait(home, other).status.success());
+    let before = json(home, &["status"]);
+    let output = cli(home, &["queue", "--queue", "project-a"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains(&format!("BLOCKED by #{failed}")), "{text}");
+    assert!(text.contains("waiting 1"));
+    assert!(text.contains("waiting 2"));
+    assert!(text.find("first-waiter").unwrap() < text.find("second-waiter").unwrap());
+    assert!(!text.contains("project-b"));
+    assert!(!text.contains("other-project"));
+    let selected = json(home, &["queue", "--queue", "project-a", "--json"]);
+    let ids: Vec<i64> = selected
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|job| job["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![failed, first, second]);
+    assert_eq!(
+        json(home, &["status"]),
+        before,
+        "viewing must not mutate jobs"
+    );
+    let empty = cli(home, &["queue", "--queue", "project-b"]);
+    assert_eq!(
+        String::from_utf8(empty.stdout).unwrap(),
+        "No jobs to display.\n"
+    );
+    let history = json(home, &["queue", "--queue", "project-b", "--all", "--json"]);
+    assert_eq!(history[0]["id"], other);
+}
