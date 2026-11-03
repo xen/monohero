@@ -3,7 +3,13 @@
 Preserve project instructions, release approvals and checks. Choose one shared
 queue name per exclusive resource; all worktrees use the same Monohero home.
 Separate projects can use separate queues. Sending to a specific chat requires
-the human owner's authorization. Install Monohero and run one explicitly
+the human owner's authorization. Approval to release work in this existing chat
+includes enqueueing it and delivering its grant back to the same chat; do not
+ask again merely to select `enqueue` instead of a command workflow. Continuing
+the same chat does not create a nested agent. A project's previous command-only
+instruction is superseded only when its human owner authorizes this policy.
+Other chats, new tasks, first release approval and goal pausing retain their
+own authorization requirements. Install Monohero and run one explicitly
 configured `monohero serve` under a user service.
 
 ## Codex: resume this chat when its turn comes

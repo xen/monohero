@@ -211,3 +211,9 @@ worktree directories and destination chat IDs. Positions are per queue; differen
 projects remain independent. Failed/interrupted jobs explicitly show why a queue
 cannot advance. Viewing never claims, resolves or retries a job. It reads once
 and exits; there is no automatic refresh. `status` retains its existing JSON format.
+
+Release approval and queue mode are separate decisions: once the human has
+approved releasing this chat's work and using native chat handoff, agents should
+enqueue and resume the same chat without asking again about the mechanism.
+Projects should replace stale command-only rules in their AGENTS.md and release
+protocol together. Queueing never expands the approved work or waives checks.
