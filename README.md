@@ -76,6 +76,12 @@ state. Configure `--proxy [--socket /absolute/public/control.sock]` only for the
 owning host's public app-server proxy. Connection errors stay visible as unknown;
 Monohero does not switch to a different connection or use private desktop sockets.
 
+When monitoring confirms that a Codex chat is archived, Monohero cancels its
+waiting and deferred jobs. For a running managed grant, cancellation first drains
+protected commands; legacy claimed work still requires its owner's explicit yield.
+If the archive list is unavailable, no chat is inferred to be archived. Worktrees,
+job records and failure barriers are retained.
+
 New chat grants require protected commands to run through
 `monohero run JOB_ID --thread CHAT_UUID -- COMMAND ARGS`. Deferral first stops new
 commands, then waits for inherited command locks to drain. A failed protected

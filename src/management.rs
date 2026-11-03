@@ -122,6 +122,9 @@ pub enum Control {
     Cancel {
         id: i64,
     },
+    CancelArchived {
+        id: i64,
+    },
     Resume {
         id: i64,
     },
@@ -445,6 +448,9 @@ pub fn apply(action: Control, s: &Shared) -> Result<Value> {
         }
         Control::Cancel { id } => {
             return request_release(s, id, "cancel", "Cancelled by operator", None)
+        }
+        Control::CancelArchived { id } => {
+            return request_release(s, id, "cancel", "Chat archived", None)
         }
         Control::Clear {
             queue,
