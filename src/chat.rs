@@ -37,6 +37,12 @@ pub enum Actions {
         #[arg(long)]
         park_goal: bool,
     },
+    /// Configure a native URL opener to wake unloaded Codex app chats after delivery.
+    ConfigureWake {
+        /// Absolute executable, e.g. /usr/bin/open on macOS; receives one Codex URL.
+        #[arg(long)]
+        opener: PathBuf,
+    },
     /// Explicitly restore an unchanged goal left paused after cancellation/failure.
     UnparkGoal {
         #[arg(long)]
@@ -108,6 +114,8 @@ struct Receipt {
     updated_at: u64,
     finish_requested: Option<bool>,
     error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    app_wake: Option<String>,
 }
 fn now() -> u64 {
     SystemTime::now()
@@ -290,6 +298,25 @@ pub fn run(action: Actions, home: &Path) -> Result<()> {
             let result = submit(home, queue, key, cwd, command).context("submission failed; if --park-goal was used, inspect HOME/goals and explicitly unpark the unchanged goal")?;
             print(result)
         }
+        Actions::ConfigureWake { opener } => {
+            if !opener.is_absolute() {
+                bail!("native URL opener must be an absolute executable path");
+            }
+            let opener = executable(&opener)?;
+            fs::create_dir_all(home)?;
+            let path = home.join("app-wake.json");
+            let temporary = path.with_extension("json.tmp");
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            serde_json::to_writer_pretty(&mut file, &json!({"opener":opener}))?;
+            file.sync_all()?;
+            fs::rename(temporary, &path)?;
+            print(json!({"configured":path,"opener":opener}))
+        }
         Actions::UnparkGoal { thread, codex } => {
             validate_thread(&thread)?;
             super::goal::restore(home, &executable(&codex)?, &thread, None)?;
@@ -407,6 +434,7 @@ fn receive(
         updated_at: now(),
         finish_requested: None,
         error: None,
+        app_wake: None,
     };
     persist(&path, &mut r)?;
     let lock = OpenOptions::new()
@@ -429,6 +457,14 @@ fn receive(
     match dispatch(codex, thread, prompt, home, id) {
         Ok(message) => {
             r.message_id = Some(message);
+            // Save accepted delivery before any external wake; never resend on wake failure.
+            persist(&path, &mut r)?;
+            if let Err(error) = wake_app(home, thread, id, &path, &mut r) {
+                r.state = "failed".into();
+                r.error = Some(format!("native app wake failed after message acceptance: {error:#}; inspect before retrying"));
+                persist(&path, &mut r)?;
+                return Err(error);
+            }
             if let Some(owner) = parked_goal {
                 if let Err(error) = super::goal::restore(home, codex, thread, Some(owner)) {
                     r.state = "failed".into();
@@ -536,4 +572,36 @@ fn dispatch(codex: &Path, thread: &str, prompt: &str, home: &Path, id: i64) -> R
         }
     }
     bail!("Codex did not confirm the exact destination thread; delivery is uncertain, do not retry blindly")
+}
+
+fn wake_app(home: &Path, thread: &str, id: i64, path: &Path, receipt: &mut Receipt) -> Result<()> {
+    let body = match fs::read(home.join("app-wake.json")) {
+        Ok(body) => body,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Config {
+        opener: PathBuf,
+    }
+    let config: Config = serde_json::from_slice(&body).context("invalid app-wake.json")?;
+    if !config.opener.is_absolute() {
+        bail!("configured URL opener must be absolute");
+    }
+    receipt.app_wake = Some("opening".into());
+    persist(path, receipt)?;
+    let status = Command::new(&config.opener)
+        .arg(format!("codex://threads/{thread}"))
+        .env("MONOHERO_HOME", home)
+        .env("MONOHERO_JOB_ID", id.to_string())
+        .env("MONOHERO_THREAD_ID", thread)
+        .stdin(Stdio::null())
+        .status()
+        .context("unable to invoke native URL opener")?;
+    if !status.success() {
+        bail!("native URL opener failed: {status}");
+    }
+    receipt.app_wake = Some("requested".into());
+    persist(path, receipt)
 }

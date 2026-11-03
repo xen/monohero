@@ -218,3 +218,32 @@ approved releasing this chat's work and using native chat handoff, agents should
 enqueue and resume the same chat without asking again about the mechanism.
 Projects should replace stale command-only rules in their AGENTS.md and release
 protocol together. Queueing never expands the approved work or waives checks.
+
+## Wake unloaded Codex app chats
+
+Some desktop hosts store `codex queue` messages without loading an inactive
+chat. In that case a grant stays `message_queued`, no agent claims it, and later
+jobs correctly remain blocked. Opening the existing chat's native link can let
+the app consume that already queued message.
+
+On a macOS desktop with Codex installed, explicitly enable native URL opening:
+
+```sh
+monohero configure-wake --opener /usr/bin/open
+```
+
+After accepting each chat message, Monohero invokes that executable once with
+`codex://threads/EXACT_UUID`. This opens/selects the existing chat and can bring
+the app forward. It creates no new chat or second prompt, changes no permissions,
+and never claims or finishes the job. An actual `claim` is still required.
+The configuration is shared by all queues in the same Monohero home. Future
+workers read it when dispatching, including previously queued jobs that use the
+updated CLI. Running workers are not changed or restarted.
+
+The integration was verified on a macOS desktop by waking a previously unloaded
+chat and observing its actual claim. Other hosts must verify URL handling and
+queued-message consumption; successful URL opening alone proves neither.
+An opener failure is explicit: the accepted message ID remains recorded, the job
+fails and blocks its queue, and nothing is resent or retried automatically.
+Without `app-wake.json`, URL opening is disabled. Remove that file from the
+shared Monohero home to disable it again. Do not enable a periodic status loop.
