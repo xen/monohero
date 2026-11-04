@@ -369,13 +369,8 @@ pub fn evaluate(s: &Shared, job: &Job, observation: &Value) -> Result<()> {
             && r["updated_at"]
                 .as_u64()
                 .is_some_and(|time| now().saturating_sub(time) >= grace);
-        let current_turn = observation["turn_started_at"]
-            .as_u64()
-            .is_some_and(|start| {
-                start.saturating_add(30) >= r["claimed_at"].as_u64().unwrap_or(u64::MAX)
-            });
         let managed = r["managed"] == true;
-        if no_claim || blocked && managed && (authority || current_turn) {
+        if no_claim || blocked && managed && authority {
             let reason = if no_claim {
                 "Chat did not claim its invitation within the configured grace period"
             } else {

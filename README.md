@@ -73,6 +73,9 @@ turn/goal metadata. It cannot prove the desktop runtime's live approval/input
 state. Configure `--proxy [--socket /absolute/public/control.sock]` only for the
 owning host's public app-server proxy. Connection errors stay visible as unknown;
 Monohero does not switch to a different connection or use private desktop sockets.
+Only an authoritative owning-runtime observation can revoke a claimed managed
+grant; a recent failed or interrupted turn in persisted history cannot prove
+that the current turn is blocked.
 
 When monitoring confirms that a Codex chat is archived, Monohero cancels its
 waiting and deferred jobs. For a running managed grant, cancellation first drains
