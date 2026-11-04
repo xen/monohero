@@ -109,6 +109,7 @@ enum Request {
         queue: Option<String>,
     },
     Snapshot,
+    Capabilities,
     Manage {
         action: management::Control,
     },
@@ -305,6 +306,7 @@ fn handle(r: Request, s: &Shared) -> Result<serde_json::Value> {
             }
         }
         Request::Snapshot => management::snapshot(s),
+        Request::Capabilities => Ok(serde_json::json!({"chat_request_batches_v1":true})),
         Request::Manage { action } => management::apply(action, s),
         Request::Status { queue } => {
             let mut js = jobs(&c)?;

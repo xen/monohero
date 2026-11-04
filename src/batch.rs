@@ -1,5 +1,5 @@
 //! Durable chat submissions joined to one FIFO grant before claim.
-use crate::{jobs, name, signal, Shared};
+use crate::{name, signal, Shared};
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -15,10 +15,8 @@ pub fn schema(c: &Connection) -> Result<()> {
     Ok(())
 }
 pub fn capable(home: &Path) -> Result<bool> {
-    match crate::call(home, &crate::Request::Snapshot) {
-        Ok(value) => Ok(value["capabilities"]
-            .as_array()
-            .is_some_and(|items| items.iter().any(|item| item == "chat_request_batches_v1"))),
+    match crate::call(home, &crate::Request::Capabilities) {
+        Ok(value) => Ok(value["chat_request_batches_v1"] == true),
         Err(error) if format!("{error:#}").contains("unknown variant") => Ok(false),
         Err(error) => Err(error),
     }
@@ -166,22 +164,26 @@ pub fn submit(
                 bail!("the prior grant was claimed or changed before this request could join; retry explicitly");
             }
             // A legacy worker cannot deliver added requests. Preserve it and fail explicitly.
-            for j in jobs(c)?.iter().filter(|j| {
-                j.queue == queue
-                    && !j.archived
-                    && matches!(j.state.as_str(), "queued" | "running" | "deferred")
-                    && crate::management::thread_id(j).as_deref() == Some(thread)
-                    && chat_thread(&j.command).is_some()
-            }) {
+            let mut legacy_query=c.prepare("SELECT id,command FROM jobs WHERE queue=?1 AND archived=0 AND state IN ('queued','running','deferred')")?;
+            let rows = legacy_query
+                .query_map([queue], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for (id, encoded) in rows {
+                let candidate: Vec<String> = serde_json::from_str(&encoded)?;
+                if chat_thread(&candidate) != Some(thread) {
+                    continue;
+                }
                 let belongs_to_batch: i64 = c.query_row(
                     "SELECT COUNT(*) FROM chat_batches WHERE job_id=?1",
-                    [j.id],
+                    [id],
                     |r| r.get(0),
                 )?;
                 if belongs_to_batch > 0 {
                     continue;
                 }
-                let claimed = crate::management::receipt(&s.home, j.id)?
+                let claimed = crate::management::receipt(&s.home, id)?
                     .is_some_and(|receipt| !receipt["claimed_at"].is_null());
                 if !claimed {
                     bail!("existing legacy chat grant cannot accumulate requests; wait for its claim or completion");
@@ -282,44 +284,67 @@ pub fn requests(home: &Path, id: i64) -> Result<Value> {
     if table == 0 {
         bail!("this service has no accumulated-request records");
     }
-    let records = jobs(&c)?;
-    let mut cursor = id;
-    let mut ancestors = std::collections::HashSet::new();
-    loop {
-        if !ancestors.insert(cursor) {
-            bail!("invalid request ancestry");
+    c.execute_batch("BEGIN")?;
+    let result = (|| -> Result<Value> {
+        let mut cursor = id;
+        let mut ancestors = std::collections::HashSet::new();
+        loop {
+            if !ancestors.insert(cursor) {
+                bail!("invalid request ancestry");
+            }
+            let parent: Option<i64> = c
+                .query_row("SELECT parent_id FROM jobs WHERE id=?1", [cursor], |row| {
+                    row.get(0)
+                })
+                .optional()?
+                .context("unknown job or missing request ancestor")?;
+            match parent {
+                Some(parent) if parent < cursor => cursor = parent,
+                Some(_) => bail!("invalid request ancestry"),
+                None => break,
+            }
         }
-        let job = records
-            .iter()
-            .find(|job| job.id == cursor)
-            .context("unknown job or missing request ancestor")?;
-        match job.parent_id {
-            Some(parent) if parent < cursor => cursor = parent,
-            Some(_) => bail!("invalid request ancestry"),
-            None => break,
+        let mut query=c.prepare("SELECT sequence,origin_job_id,job_id,key,cwd,command FROM chat_batch_requests WHERE origin_job_id=?1 ORDER BY sequence")?;
+        let mut entries = Vec::new();
+        let mut batched = false;
+        for ancestor in ancestors {
+            batched |= c.query_row(
+                "SELECT COUNT(*) FROM chat_batches WHERE job_id=?1",
+                [ancestor],
+                |row| row.get::<_, i64>(0),
+            )? > 0;
+            let rows = query.query_map([ancestor], |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            })?;
+            for row in rows {
+                let (sequence, origin, current, key, cwd, command) = row?;
+                let command: Vec<String> = serde_json::from_str(&command)?;
+                entries.push((sequence,json!({"sequence":sequence,"origin_job":origin,"current_job":current,"key":key,"cwd":cwd,"message":argument(&command,"--message").context("batched request lacks message")?})));
+            }
+        }
+        entries.sort_by_key(|(sequence, _)| *sequence);
+        if batched && entries.is_empty() {
+            bail!("batched job is missing its request records");
+        }
+        Ok(
+            json!({"job_id":id,"batched":batched,"requests":entries.into_iter().map(|(_,value)|value).collect::<Vec<_>>()}),
+        )
+    })();
+    match result {
+        Ok(value) => {
+            c.execute_batch("COMMIT")?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = c.execute_batch("ROLLBACK");
+            Err(error)
         }
     }
-    let mut query=c.prepare("SELECT sequence,origin_job_id,job_id,key,cwd,command FROM chat_batch_requests WHERE origin_job_id=?1 ORDER BY sequence")?;
-    let mut entries = Vec::new();
-    for ancestor in ancestors {
-        let rows = query.query_map([ancestor], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, i64>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, String>(4)?,
-                r.get::<_, String>(5)?,
-            ))
-        })?;
-        for row in rows {
-            let (sequence, origin, current, key, cwd, command) = row?;
-            let command: Vec<String> = serde_json::from_str(&command)?;
-            entries.push((sequence,json!({"sequence":sequence,"origin_job":origin,"current_job":current,"key":key,"cwd":cwd,"message":argument(&command,"--message").context("batched request lacks message")?})));
-        }
-    }
-    entries.sort_by_key(|(sequence, _)| *sequence);
-    Ok(
-        json!({"job_id":id,"requests":entries.into_iter().map(|(_,value)|value).collect::<Vec<_>>()}),
-    )
 }

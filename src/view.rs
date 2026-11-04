@@ -43,6 +43,9 @@ fn render(jobs: &[Job]) -> String {
                 job.state.clone()
             };
             writeln!(output, "  #{:<5} {:<14} {}", job.id, label, job.key).unwrap();
+            if let Some(count) = job.request_count.filter(|count| *count > 1) {
+                writeln!(output, "         {count} accumulated requests").unwrap();
+            }
             if let Some(reason) = &job.hold_reason {
                 writeln!(output, "         attention: {reason}").unwrap();
             }
