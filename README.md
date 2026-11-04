@@ -225,10 +225,23 @@ End the turn after submission. On grant, Monohero sends a message through the
 Codex CLI's `queue --thread UUID --message TEXT`. The Codex host continues the
 same conversation. No separate CLI agent, new chat or coordinator model is started.
 
-The destination executes `monohero claim JOB_ID --thread UUID`, performs all
+Repeated `enqueue` calls for the same exact chat in the same queue before its
+claim join the existing FIFO position. Each request keeps its own key, message
+and worktree; the claim response lists all requests in submission order. A new
+request after claim joins the tail as a new job. Other queues are independent.
+An unclaimed deferred group remains deferred until explicitly resumed.
+Retrying a previously accepted key returns its original job ID; after an
+explicit resume, `current_job` identifies the successor carrying that request.
+The queue view and dashboard show the number of accumulated requests.
+`monohero requests JOB_ID` shows the recorded messages and worktrees, including
+for interrupted or deferred work, without retrying it.
+
+The destination executes `monohero claim JOB_ID --thread UUID`, reads every
+request in the claim response, performs all
 protected work, then `monohero finish JOB_ID --thread UUID`. A queued message is
 only transport acceptance: the claim is confirmation that the chat resumed.
-There is no automatic expiry. Wrong-thread claims/finishes are rejected. Missing
+With monitoring enabled, an unclaimed invitation can be deferred after its
+configured grace period. Wrong-thread claims/finishes are rejected. Missing
 claims remain visibly unacknowledged instead of pretending delivery succeeded.
 No protected work is allowed after finish. Grants to the same thread are also
 serialized across independent project queues.
@@ -238,7 +251,10 @@ messages its owner on completion. The destination runs the supplied `acknowledge
 command, inspects evidence and continues authorized follow-up. A notice grants no
 release slot. These commands work with a running 0.1.1 service through the stable
 command protocol; active jobs need not be killed or restarted. Keep versioned
-worker executables available unchanged while queued jobs reference them.
+worker executables available unchanged while queued jobs reference them. A
+service predating request accumulation continues to run existing jobs; a new
+client explicitly rejects a repeat it cannot safely combine until the service
+is updated. Existing legacy pending grants are not changed automatically.
 
 Installations must verify that their Codex host consumes queued messages and
 starts idle chats. Unsupported hosts leave an explicit unacknowledged receipt;

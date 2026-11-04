@@ -163,6 +163,427 @@ fn receipt(h: &Path, id: i64) -> Value {
 fn finish(h: &Path, id: i64) {
     json(h, &["finish", &id.to_string(), "--thread", THREAD]);
 }
+fn enqueue_message(
+    h: &Path,
+    codex: &Path,
+    queue: &str,
+    key: &str,
+    cwd: &Path,
+    message: &str,
+) -> Value {
+    json(
+        h,
+        &[
+            "enqueue",
+            "--queue",
+            queue,
+            "--key",
+            key,
+            "--thread",
+            THREAD,
+            "--codex",
+            codex.to_str().unwrap(),
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--message",
+            message,
+        ],
+    )
+}
+
+#[test]
+fn repeated_requests_share_position_until_claim_and_preserve_worktrees() {
+    let s = server();
+    let h = s.home.path();
+    let codex = stub(h, "unclaimed");
+    let one = h.join("one");
+    let two = h.join("two");
+    fs::create_dir(&one).unwrap();
+    fs::create_dir(&two).unwrap();
+    json(h, &["policy", "--queue", "p", "--blocked", "attention"]);
+    json(h, &["pause-queue", "p"]);
+    let a = enqueue_message(h, &codex, "p", "one", &one, "first")["id"]
+        .as_i64()
+        .unwrap();
+    let b = enqueue_message(h, &codex, "p", "two", &two, "second");
+    assert_eq!(b["id"], a);
+    assert_eq!(b["coalesced"], true);
+    let snapshot = json(h, &["inspect"]);
+    assert_eq!(
+        snapshot["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|job| job["id"] == a)
+            .unwrap()["request_count"],
+        2
+    );
+    assert_eq!(
+        enqueue_message(h, &codex, "p", "two", &two, "second")["id"],
+        a
+    );
+    assert!(!cli(
+        h,
+        &[
+            "enqueue",
+            "--queue",
+            "p",
+            "--key",
+            "two",
+            "--thread",
+            THREAD,
+            "--codex",
+            codex.to_str().unwrap(),
+            "--cwd",
+            two.to_str().unwrap(),
+            "--message",
+            "changed"
+        ]
+    )
+    .status
+    .success());
+    json(h, &["policy", "--queue", "other", "--blocked", "attention"]);
+    json(h, &["pause-queue", "other"]);
+    let other_queue = enqueue_message(h, &codex, "other", "other", &one, "independent")["id"]
+        .as_i64()
+        .unwrap();
+    assert_ne!(other_queue, a);
+    json(h, &["resume-queue", "p"]);
+    await_file(&h.join(format!("ready-{a}")));
+    let end = Instant::now() + Duration::from_secs(10);
+    while receipt(h, a)["state"] != "message_queued" {
+        assert!(Instant::now() < end);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        enqueue_message(h, &codex, "p", "three", &one, "third")["id"],
+        a
+    );
+    let claim = json(h, &["claim", &a.to_string(), "--thread", THREAD]);
+    assert_eq!(claim["requests"].as_array().unwrap().len(), 3);
+    assert_eq!(claim["requests"][0]["message"], "first");
+    assert_eq!(claim["requests"][1]["message"], "second");
+    assert_eq!(
+        claim["requests"][1]["cwd"],
+        fs::canonicalize(&two).unwrap().to_str().unwrap()
+    );
+    assert_eq!(claim["requests"][2]["message"], "third");
+    assert_eq!(
+        enqueue_message(h, &codex, "p", "two", &two, "second")["id"],
+        a
+    );
+    assert!(!cli(
+        h,
+        &["submit", "--queue", "p", "--key", "two", "--", "/bin/true"]
+    )
+    .status
+    .success());
+    let next = enqueue_message(h, &codex, "p", "four", &one, "after claim")["id"]
+        .as_i64()
+        .unwrap();
+    assert_ne!(a, next);
+    finish(h, a);
+    assert!(wait(h, a).status.success());
+    await_file(&h.join(format!("ready-{next}")));
+    let claim = json(h, &["claim", &next.to_string(), "--thread", THREAD]);
+    assert_eq!(claim["requests"][0]["message"], "after claim");
+    finish(h, next);
+}
+
+#[test]
+fn concurrent_requests_have_one_fifo_position_and_are_all_claimed() {
+    let s = server();
+    let h = s.home.path();
+    let codex = stub(h, "unclaimed");
+    json(h, &["policy", "--queue", "p", "--blocked", "attention"]);
+    json(h, &["pause-queue", "p"]);
+    let workers: Vec<_> = (0..12)
+        .map(|index| {
+            let home = h.to_path_buf();
+            let codex = codex.clone();
+            thread::spawn(move || {
+                enqueue_message(
+                    &home,
+                    &codex,
+                    "p",
+                    &format!("key-{index}"),
+                    &home,
+                    &format!("request-{index}"),
+                )
+            })
+        })
+        .collect();
+    let ids: std::collections::HashSet<i64> = workers
+        .into_iter()
+        .map(|w| w.join().unwrap()["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids.len(), 1);
+    let id = *ids.iter().next().unwrap();
+    json(h, &["resume-queue", "p"]);
+    await_file(&h.join(format!("ready-{id}")));
+    let receipt_deadline = Instant::now() + Duration::from_secs(10);
+    while receipt(h, id)["state"] != "message_queued" {
+        assert!(Instant::now() < receipt_deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let claim = json(h, &["claim", &id.to_string(), "--thread", THREAD]);
+    let messages: std::collections::HashSet<_> = claim["requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["message"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(messages.len(), 12);
+    for index in 0..12 {
+        assert!(messages.contains(&format!("request-{index}")));
+    }
+    finish(h, id);
+}
+
+#[test]
+fn accumulating_keeps_first_position_ahead_of_other_chats() {
+    let s = server();
+    let h = s.home.path();
+    let codex = stub(h, "unclaimed");
+    json(h, &["policy", "--queue", "p", "--blocked", "attention"]);
+    json(h, &["pause-queue", "p"]);
+    let first = enqueue_message(h, &codex, "p", "a1", h, "a first")["id"]
+        .as_i64()
+        .unwrap();
+    let other = enqueue(h, &codex, "p", "b", OTHER);
+    assert_eq!(
+        enqueue_message(h, &codex, "p", "a2", h, "a second")["id"],
+        first
+    );
+    let jobs = json(h, &["status", "--queue", "p"]);
+    let queued: Vec<i64> = jobs
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|j| j["state"] == "queued")
+        .map(|j| j["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(queued, vec![first, other]);
+    json(h, &["resume-queue", "p"]);
+    await_file(&h.join(format!("ready-{first}")));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while receipt(h, first)["state"] != "message_queued" {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!h.join(format!("ready-{other}")).exists());
+    let claim = json(h, &["claim", &first.to_string(), "--thread", THREAD]);
+    assert_eq!(claim["requests"].as_array().unwrap().len(), 2);
+    finish(h, first);
+    await_file(&h.join(format!("ready-{other}")));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while receipt(h, other)["state"] != "message_queued" {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    json(h, &["claim", &other.to_string(), "--thread", OTHER]);
+    json(h, &["finish", &other.to_string(), "--thread", OTHER]);
+}
+
+#[test]
+fn deferred_accumulated_requests_follow_the_explicit_resume() {
+    let s = server();
+    let h = s.home.path();
+    let codex = stub(h, "unclaimed");
+    json(h, &["policy", "--queue", "p", "--blocked", "attention"]);
+    json(h, &["pause-queue", "p"]);
+    let id = enqueue_message(h, &codex, "p", "first", h, "first")["id"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        enqueue_message(h, &codex, "p", "second", h, "second")["id"],
+        id
+    );
+    json(
+        h,
+        &["defer", &id.to_string(), "--reason", "needs attention"],
+    );
+    assert_eq!(
+        enqueue_message(h, &codex, "p", "third", h, "third")["id"],
+        id
+    );
+    let next = json(h, &["resume", &id.to_string()])["new_job"]
+        .as_i64()
+        .unwrap();
+    let retry = enqueue_message(h, &codex, "p", "second", h, "second");
+    assert_eq!(retry["id"], id);
+    assert_eq!(retry["current_job"], next);
+    assert_eq!(
+        enqueue_message(h, &codex, "p", "fourth", h, "fourth")["id"],
+        next
+    );
+    assert_eq!(
+        json(h, &["requests", &id.to_string()])["requests"]
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(
+        json(h, &["requests", &next.to_string()])["requests"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    json(h, &["resume-queue", "p"]);
+    await_file(&h.join(format!("ready-{next}")));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while receipt(h, next)["state"] != "message_queued" {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let claim = json(h, &["claim", &next.to_string(), "--thread", THREAD]);
+    assert_eq!(claim["requests"].as_array().unwrap().len(), 4);
+    assert_eq!(claim["requests"][2]["message"], "third");
+    finish(h, next);
+}
+
+#[test]
+fn accumulated_requests_survive_service_restart() {
+    let mut s = server();
+    let h = s.home.path();
+    let codex = stub(h, "unclaimed");
+    json(h, &["policy", "--queue", "p", "--blocked", "attention"]);
+    json(h, &["pause-queue", "p"]);
+    let first = enqueue_message(h, &codex, "p", "first", h, "before restart")["id"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        enqueue_message(h, &codex, "p", "second", h, "also before")["id"],
+        first
+    );
+    s.child.kill().unwrap();
+    s.child.wait().unwrap();
+    s.child = start(h);
+    assert_eq!(
+        enqueue_message(h, &codex, "p", "third", h, "after restart")["id"],
+        first
+    );
+    json(h, &["resume-queue", "p"]);
+    await_file(&h.join(format!("ready-{first}")));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while receipt(h, first)["state"] != "message_queued" {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let claim = json(h, &["claim", &first.to_string(), "--thread", THREAD]);
+    assert_eq!(claim["requests"].as_array().unwrap().len(), 3);
+    assert_eq!(claim["requests"][2]["message"], "after restart");
+    finish(h, first);
+}
+
+#[test]
+fn tail_deferral_preserves_every_accumulated_request() {
+    let s = server();
+    let h = s.home.path();
+    let codex = stub(h, "unclaimed");
+    json(h, &["policy", "--queue", "p", "--blocked", "tail"]);
+    json(h, &["pause-queue", "p"]);
+    let first = enqueue_message(h, &codex, "p", "first", h, "first")["id"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        enqueue_message(h, &codex, "p", "second", h, "second")["id"],
+        first
+    );
+    json(h, &["resume-queue", "p"]);
+    await_file(&h.join(format!("ready-{first}")));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while receipt(h, first)["state"] != "message_queued" {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    json(
+        h,
+        &["defer", &first.to_string(), "--reason", "waiting for input"],
+    );
+    await_state(h, first, "requeued");
+    let jobs = json(h, &["status", "--queue", "p"]);
+    let held = jobs
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|j| j["parent_id"] == first)
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(
+        enqueue_message(h, &codex, "p", "third", h, "third")["id"],
+        held
+    );
+    let next = json(h, &["resume", &held.to_string()])["new_job"]
+        .as_i64()
+        .unwrap();
+    await_file(&h.join(format!("ready-{next}")));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while receipt(h, next)["state"] != "message_queued" {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let claim = json(h, &["claim", &next.to_string(), "--thread", THREAD]);
+    assert_eq!(claim["requests"].as_array().unwrap().len(), 3);
+    finish(h, next);
+}
+
+#[test]
+fn request_racing_claim_is_delivered_exactly_once() {
+    for round in 0..8 {
+        let s = server();
+        let h = s.home.path();
+        let codex = stub(h, "unclaimed");
+        let first = enqueue_message(h, &codex, "p", "first", h, "first")["id"]
+            .as_i64()
+            .unwrap();
+        await_file(&h.join(format!("ready-{first}")));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while receipt(h, first)["state"] != "message_queued" {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        let home = h.to_path_buf();
+        let other_home = home.clone();
+        let codex = codex.clone();
+        let claim =
+            thread::spawn(move || json(&home, &["claim", &first.to_string(), "--thread", THREAD]));
+        let submit = thread::spawn(move || {
+            enqueue_message(
+                &other_home,
+                &codex,
+                "p",
+                "second",
+                &other_home,
+                &format!("later-{round}"),
+            )
+        });
+        let claim = claim.join().unwrap();
+        let next = submit.join().unwrap()["id"].as_i64().unwrap();
+        let first_contains = claim["requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["message"] == format!("later-{round}"));
+        assert_eq!(first_contains, next == first);
+        finish(h, first);
+        if next != first {
+            await_file(&h.join(format!("ready-{next}")));
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while receipt(h, next)["state"] != "message_queued" {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(10));
+            }
+            let claim = json(h, &["claim", &next.to_string(), "--thread", THREAD]);
+            assert_eq!(claim["requests"].as_array().unwrap().len(), 1);
+            assert_eq!(claim["requests"][0]["message"], format!("later-{round}"));
+            finish(h, next);
+        }
+    }
+}
 #[test]
 fn chat_grant_is_fifo_and_requires_matching_claim_and_finish() {
     let s = server();
@@ -390,6 +811,182 @@ fn parked_enqueue(h: &Path, codex: &Path, key: &str) -> i64 {
 }
 fn read_goal(h: &Path) -> Value {
     serde_json::from_slice(&fs::read(h.join("fake-goal.json")).unwrap()).unwrap()
+}
+
+#[test]
+fn repeated_parked_requests_share_one_goal_and_one_grant() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "unclaimed");
+    json(h, &["policy", "--queue", "p", "--blocked", "attention"]);
+    json(h, &["pause-queue", "p"]);
+    let first = parked_enqueue(h, &codex, "first");
+    assert_eq!(parked_enqueue(h, &codex, "second"), first);
+    assert_eq!(parked_enqueue(h, &codex, "second"), first);
+    assert_eq!(read_goal(h)["status"], "paused");
+    json(h, &["resume-queue", "p"]);
+    await_file(&h.join(format!("ready-{first}")));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while receipt(h, first)["state"] != "message_queued" {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(read_goal(h)["status"], "active");
+    let claim = json(h, &["claim", &first.to_string(), "--thread", THREAD]);
+    assert_eq!(claim["requests"].as_array().unwrap().len(), 2);
+    finish(h, first);
+}
+
+#[test]
+fn a_repeated_request_can_park_the_goal_for_an_existing_queued_grant() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "unclaimed");
+    json(h, &["policy", "--queue", "p", "--blocked", "attention"]);
+    json(h, &["pause-queue", "p"]);
+    let first = enqueue(h, &codex, "p", "without-park", THREAD);
+    assert_eq!(parked_enqueue(h, &codex, "with-park"), first);
+    assert_eq!(read_goal(h)["status"], "paused");
+    json(h, &["resume-queue", "p"]);
+    await_file(&h.join(format!("ready-{first}")));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while receipt(h, first)["state"] != "message_queued" {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(read_goal(h)["status"], "active");
+    let claim = json(h, &["claim", &first.to_string(), "--thread", THREAD]);
+    assert_eq!(claim["requests"].as_array().unwrap().len(), 2);
+    finish(h, first);
+}
+
+#[test]
+fn joining_an_already_delivered_grant_does_not_park_its_goal() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "unclaimed");
+    let first = enqueue(h, &codex, "p", "first", THREAD);
+    await_file(&h.join(format!("ready-{first}")));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while receipt(h, first)["state"] != "message_queued" {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let result = json(
+        h,
+        &[
+            "enqueue",
+            "--queue",
+            "p",
+            "--key",
+            "second",
+            "--thread",
+            THREAD,
+            "--codex",
+            codex.to_str().unwrap(),
+            "--cwd",
+            h.to_str().unwrap(),
+            "--park-goal",
+        ],
+    );
+    assert_eq!(result["id"], first);
+    assert_eq!(result["goal"], "already_dispatched_not_paused");
+    assert_eq!(read_goal(h)["status"], "active");
+    let claim = json(h, &["claim", &first.to_string(), "--thread", THREAD]);
+    assert_eq!(claim["requests"].as_array().unwrap().len(), 2);
+    finish(h, first);
+}
+
+#[test]
+fn a_goal_cannot_be_parked_while_its_chat_owns_a_claimed_grant() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "manual");
+    let first = enqueue(h, &codex, "p", "first", THREAD);
+    await_file(&h.join(format!("ready-{first}")));
+    let result = cli(
+        h,
+        &[
+            "enqueue",
+            "--queue",
+            "q",
+            "--key",
+            "next",
+            "--thread",
+            THREAD,
+            "--codex",
+            codex.to_str().unwrap(),
+            "--cwd",
+            h.to_str().unwrap(),
+            "--park-goal",
+        ],
+    );
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("owns a claimed grant"));
+    assert_eq!(read_goal(h)["status"], "active");
+    finish(h, first);
+}
+
+#[test]
+fn a_deferred_unclaimed_group_can_accept_a_new_parked_goal() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "unclaimed");
+    json(h, &["policy", "--queue", "p", "--blocked", "attention"]);
+    let first = enqueue(h, &codex, "p", "first", THREAD);
+    await_file(&h.join(format!("ready-{first}")));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while receipt(h, first)["state"] != "message_queued" {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    json(
+        h,
+        &["defer", &first.to_string(), "--reason", "needs attention"],
+    );
+    await_state(h, first, "deferred");
+    assert_eq!(parked_enqueue(h, &codex, "second"), first);
+    assert_eq!(read_goal(h)["status"], "paused");
+    let next = json(h, &["resume", &first.to_string()])["new_job"]
+        .as_i64()
+        .unwrap();
+    await_file(&h.join(format!("ready-{next}")));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while receipt(h, next)["state"] != "message_queued" {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(read_goal(h)["status"], "active");
+    let claim = json(h, &["claim", &next.to_string(), "--thread", THREAD]);
+    assert_eq!(claim["requests"].as_array().unwrap().len(), 2);
+    finish(h, next);
+}
+
+#[test]
+fn accumulated_parked_goal_is_not_restored_after_user_changes_it() {
+    let s = server();
+    let h = s.home.path();
+    let codex = goal_stub(h, "unclaimed");
+    json(h, &["policy", "--queue", "p", "--blocked", "attention"]);
+    json(h, &["pause-queue", "p"]);
+    let first = enqueue(h, &codex, "p", "first", THREAD);
+    assert_eq!(parked_enqueue(h, &codex, "second"), first);
+    let mut changed = read_goal(h);
+    changed["objective"] = serde_json::json!("User changed objective");
+    changed["updatedAt"] = serde_json::json!(99);
+    fs::write(
+        h.join("fake-goal.json"),
+        serde_json::to_vec(&changed).unwrap(),
+    )
+    .unwrap();
+    json(h, &["resume-queue", "p"]);
+    assert!(!wait(h, first).status.success());
+    assert_eq!(read_goal(h), changed);
+    assert_eq!(receipt(h, first)["state"], "failed");
+    assert!(receipt(h, first)["error"]
+        .as_str()
+        .unwrap()
+        .contains("goal changed"));
 }
 #[test]
 fn parked_goal_waits_then_restores_only_after_native_grant() {

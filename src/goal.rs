@@ -160,6 +160,26 @@ fn unchanged(current: &Value, saved: &Value) -> bool {
         && current.get("tokenBudget") == saved.get("tokenBudget")
 }
 
+/// Inspect the saved owner without changing a goal. Restoration still performs
+/// the full RPC identity and lifecycle checks under the goal lock.
+pub fn parked_for(home: &Path, thread: &str, queue: &str, key: &str) -> Result<bool> {
+    let (path, _lock) = paths(home, thread)?;
+    if !path.exists() {
+        return Ok(false);
+    }
+    let saved: Saved = serde_json::from_slice(&fs::read(path)?)?;
+    if saved.queue != queue || saved.key != key {
+        return Ok(false);
+    }
+    if saved.state == "parked" {
+        return Ok(true);
+    }
+    if saved.state != "restored" {
+        bail!("goal lifecycle is uncertain; inspect its receipt");
+    }
+    Ok(false)
+}
+
 pub fn park(home: &Path, codex: &Path, thread: &str, queue: &str, key: &str) -> Result<()> {
     let (path, _lock) = paths(home, thread)?;
     let mut rpc = Rpc::start(codex)?;

@@ -96,6 +96,10 @@ pub enum Actions {
         #[arg(long)]
         managed_commands: bool,
         #[arg(long)]
+        batch_requests: bool,
+        #[arg(long)]
+        batch_join_only: bool,
+        #[arg(long)]
         goal_key: Option<String>,
     },
     #[command(hide = true)]
@@ -129,7 +133,7 @@ fn now() -> u64 {
         .unwrap()
         .as_secs()
 }
-fn validate_thread(id: &str) -> Result<()> {
+pub(crate) fn validate_thread(id: &str) -> Result<()> {
     if id.len() != 36
         || !id.bytes().enumerate().all(|(i, b)| {
             if [8, 13, 18, 23].contains(&i) {
@@ -260,6 +264,8 @@ pub fn run(action: Actions, home: &Path) -> Result<()> {
             name(&key)?;
             let codex = executable(&codex)?;
             let cwd = fs::canonicalize(cwd.unwrap_or(std::env::current_dir()?))?;
+            let _admission = crate::batch::admission(home, &queue, &thread)?;
+            let supported = crate::batch::capable(home)?;
             let mut command = own_command(
                 home,
                 vec![
@@ -277,7 +283,65 @@ pub fn run(action: Actions, home: &Path) -> Result<()> {
                 ],
             )?;
             command.push("--managed-commands".into());
+            command.push("--batch-requests".into());
+            if supported {
+                if let Some((old_cwd, old_command)) = crate::batch::lookup(home, &queue, &key)? {
+                    let same = old_cwd == text(&cwd)?
+                        && old_command.first() == command.first()
+                        && crate::batch::argument(&old_command, "--thread")
+                            == Some(thread.as_str())
+                        && crate::batch::argument(&old_command, "--codex")
+                            == Some(text(&codex)?.as_str())
+                        && crate::batch::argument(&old_command, "--message")
+                            == crate::batch::argument(&command, "--message")
+                        && old_command.iter().any(|arg| arg == "--park-goal") == park_goal;
+                    if !same {
+                        bail!("key already exists with different inputs; choose a new key");
+                    }
+                    return print(submit(home, queue, key, cwd, old_command)?);
+                }
+            } else {
+                let status = call(
+                    home,
+                    &Request::Status {
+                        queue: Some(queue.clone()),
+                    },
+                )?;
+                for value in status.as_array().context("invalid job list")? {
+                    let job: crate::Job = serde_json::from_value(value.clone())?;
+                    if job.key == key
+                        || job.archived
+                        || !matches!(job.state.as_str(), "queued" | "running" | "deferred")
+                        || crate::management::thread_id(&job).as_deref() != Some(thread.as_str())
+                        || job.command.get(3).map(String::as_str) != Some("chat-worker")
+                    {
+                        continue;
+                    }
+                    let claimed = crate::management::receipt(home, job.id)?
+                        .is_some_and(|receipt| !receipt["claimed_at"].is_null());
+                    if !claimed {
+                        bail!("the running Monohero service cannot accumulate this chat's pending requests; update the service after its active work finishes");
+                    }
+                }
+            }
+            let mut goal_already_dispatched = false;
             if park_goal {
+                let all = call(home, &Request::Status { queue: None })?;
+                for value in all.as_array().context("invalid job list")? {
+                    let job: crate::Job = serde_json::from_value(value.clone())?;
+                    if job.archived
+                        || job.state != "running"
+                        || crate::management::thread_id(&job).as_deref() != Some(thread.as_str())
+                        || job.command.get(3).map(String::as_str) != Some("chat-worker")
+                    {
+                        continue;
+                    }
+                    if crate::management::receipt(home, job.id)?
+                        .is_some_and(|r| !r["claimed_at"].is_null())
+                    {
+                        bail!("cannot park this goal while its chat owns a claimed grant; finish or yield that work first");
+                    }
+                }
                 command.push("--park-goal".into());
                 let existing = call(
                     home,
@@ -300,9 +364,42 @@ pub fn run(action: Actions, home: &Path) -> Result<()> {
                         json!({"id":job["id"],"queue":job["queue"],"state":job["state"]}),
                     );
                 }
-                super::goal::park(home, &codex, &thread, &queue, &key)?;
+                let pending = if supported {
+                    crate::batch::pending(home, &queue, &thread)?
+                } else {
+                    None
+                };
+                if let Some((id, primary_key, primary_command)) = pending {
+                    let owner = crate::batch::argument(&primary_command, "--goal-key")
+                        .unwrap_or(&primary_key)
+                        .to_owned();
+                    let receipt = crate::management::receipt(home, id)?;
+                    let accepted = receipt.as_ref().is_some_and(|r| !r["message_id"].is_null());
+                    let delivered = accepted
+                        && receipt
+                            .as_ref()
+                            .is_some_and(|r| r["state"] == "message_queued");
+                    if accepted
+                        && !delivered
+                        && receipt.as_ref().is_some_and(|r| r["state"] != "deferred")
+                    {
+                        bail!("the existing invitation has uncertain delivery; inspect it before adding a parked goal");
+                    }
+                    if delivered {
+                        goal_already_dispatched = true;
+                    } else {
+                        super::goal::park(home, &codex, &thread, &queue, &owner)?;
+                    }
+                    command.push("--batch-join-only".into());
+                    command.extend(["--goal-key".into(), owner]);
+                } else {
+                    super::goal::park(home, &codex, &thread, &queue, &key)?;
+                }
             }
-            let result = submit(home, queue, key, cwd, command).context("submission failed; if --park-goal was used, inspect HOME/goals and explicitly unpark the unchanged goal")?;
+            let mut result = submit(home, queue, key, cwd, command).context("submission failed; if --park-goal was used, inspect HOME/goals and explicitly unpark the unchanged goal")?;
+            if goal_already_dispatched {
+                result["goal"] = json!("already_dispatched_not_paused");
+            }
             print(result)
         }
         Actions::ConfigureWake { opener } => {
@@ -371,11 +468,19 @@ pub fn run(action: Actions, home: &Path) -> Result<()> {
             message,
             park_goal,
             managed_commands,
+            batch_requests,
+            batch_join_only,
             goal_key,
         } => {
+            if batch_join_only {
+                bail!("a join-only request must never run as a standalone worker");
+            }
             let job = running_job(home, &queue, &key)?;
             let id = job["id"].as_i64().context("missing job ID")?;
             let mut prompt=format!("Monohero: your turn in queue {queue}. Job {id}; worktree {}. The human owner authorized this existing chat to continue: {message}\nFirst confirm receipt using:\n{}\nIf claim fails, stop without doing protected work. Then complete the already-authorized protected work, preserving project approvals/checks/review/deploy/verification. Do not poll or enqueue recursively. After ALL protected work, execute:\n{}\nOn failure/blocker append --failed and explain. Do no protected work after finish. Acknowledging the grant alone is not completion.",job["cwd"].as_str().unwrap_or(""),control(home,"claim",id,&thread)?,control(home,"finish",id,&thread)?);
+            if batch_requests {
+                prompt.push_str("\nRead the claim response. When it includes a requests array, account for each accumulated request in order and use its recorded worktree before finish.");
+            }
             if managed_commands {
                 prompt.push_str(&format!("\nThis is a managed, revocable grant. Run EVERY protected shell/Git/test/push/review/merge/deploy command through `{} --home {} run {id} --thread {thread} -- COMMAND ARGS`. Use command-line tools for protected mutations so the lease lock covers the complete action. Wait for all protected children. Before asking the human for input, yield safely with `{} --home {} defer {id} --thread {thread} --reason REASON` and stop protected work. The native monitor may revoke blocked managed grants after protected children drain. Never continue protected work after revocation or use a stale invitation; explicitly resume as a new queue entry. Failed lease validation requires stopping, not bypassing the wrapper.",text(&std::env::current_exe()?)?,text(home)?,text(&std::env::current_exe()?)?,text(home)?));
             }
@@ -386,11 +491,13 @@ pub fn run(action: Actions, home: &Path) -> Result<()> {
                 "lease",
                 &codex,
                 &prompt,
-                (
-                    park_goal
+                ReceivePolicy {
+                    initial_goal: park_goal
                         .then_some((queue.as_str(), goal_key.as_deref().unwrap_or(key.as_str()))),
-                    managed_commands,
-                ),
+                    managed: managed_commands,
+                    batch_owner: batch_requests
+                        .then_some((queue.as_str(), goal_key.as_deref().unwrap_or(key.as_str()))),
+                },
             )
         }
         Actions::NotifyWorker { id, thread, codex } => {
@@ -405,7 +512,11 @@ pub fn run(action: Actions, home: &Path) -> Result<()> {
                 "notice",
                 &codex,
                 &prompt,
-                (None, false),
+                ReceivePolicy {
+                    initial_goal: None,
+                    managed: false,
+                    batch_owner: None,
+                },
             )
         }
     }
@@ -431,6 +542,11 @@ impl Drop for SocketGuard {
         let _ = fs::remove_file(&self.0);
     }
 }
+struct ReceivePolicy<'a> {
+    initial_goal: Option<(&'a str, &'a str)>,
+    managed: bool,
+    batch_owner: Option<(&'a str, &'a str)>,
+}
 fn receive(
     home: &Path,
     id: i64,
@@ -438,9 +554,14 @@ fn receive(
     kind: &str,
     codex: &Path,
     prompt: &str,
-    policy: (Option<(&str, &str)>, bool),
+    policy: ReceivePolicy<'_>,
 ) -> Result<()> {
-    let (parked_goal, managed) = policy;
+    let ReceivePolicy {
+        initial_goal,
+        managed,
+        batch_owner,
+    } = policy;
+    let batched = batch_owner.is_some();
     validate_thread(thread)?;
     let dir = private_dir(home)?;
     let socket = dir.join(format!("{id}.sock"));
@@ -478,6 +599,18 @@ fn receive(
             return Err(std::io::Error::last_os_error().into());
         }
     }
+    let admission = batch_owner
+        .map(|(queue, _)| crate::batch::admission(home, queue, thread))
+        .transpose()?;
+    let parked_goal = if let Some((queue, key)) = batch_owner {
+        if crate::goal::parked_for(home, thread, queue, key)? {
+            Some((queue, key))
+        } else {
+            initial_goal
+        }
+    } else {
+        initial_goal
+    };
     r.state = "dispatching".into();
     persist(&path, &mut r)?;
     match dispatch(codex, thread, prompt, home, id) {
@@ -509,9 +642,11 @@ fn receive(
             return Err(e);
         }
     }
+    drop(admission);
     // CLI acceptance is not proof of resumption. Wait for the actual chat's acknowledgement.
     for stream in listener.incoming() {
         let mut stream = stream?;
+        let mut requests = None;
         let result = (|| -> Result<bool> {
             stream.set_read_timeout(Some(Duration::from_secs(10)))?;
             let mut line = String::new();
@@ -522,19 +657,41 @@ fn receive(
             }
             match value["op"].as_str() {
                 Some("claim") if kind == "lease" => {
-                    let status = call(home, &Request::Status { queue: None })?;
-                    let current = status
-                        .as_array()
-                        .context("invalid job list")?
-                        .iter()
-                        .find(|job| job["id"] == id)
-                        .context("unknown job")?;
-                    if current["state"] != "running" || !current["pending_action"].is_null() {
-                        bail!("grant no longer available; do not start protected work");
+                    let connection = crate::db(home)?;
+                    if batched {
+                        crate::batch::schema(&connection)?;
+                        connection.execute_batch("BEGIN IMMEDIATE")?;
                     }
-                    r.claimed_at.get_or_insert_with(now);
-                    r.state = "claimed".into();
-                    persist(&path, &mut r)?;
+                    let claim = (|| -> Result<()> {
+                        let status = call(home, &Request::Status { queue: None })?;
+                        let current = status
+                            .as_array()
+                            .context("invalid job list")?
+                            .iter()
+                            .find(|job| job["id"] == id)
+                            .context("unknown job")?;
+                        if current["state"] != "running" || !current["pending_action"].is_null() {
+                            bail!("grant no longer available; do not start protected work");
+                        }
+                        if batched {
+                            let entries = crate::batch::seal(&connection, id)?;
+                            if !entries.is_empty() {
+                                requests = Some(entries);
+                            }
+                        }
+                        r.claimed_at.get_or_insert_with(now);
+                        r.state = "claimed".into();
+                        persist(&path, &mut r)?;
+                        Ok(())
+                    })();
+                    if batched {
+                        if claim.is_ok() {
+                            connection.execute_batch("COMMIT")?;
+                        } else {
+                            let _ = connection.execute_batch("ROLLBACK");
+                        }
+                    }
+                    claim?;
                     Ok(false)
                 }
                 Some("finish") if kind == "lease" => {
@@ -581,7 +738,11 @@ fn receive(
         })();
         match result {
             Ok(done) => {
-                writeln!(stream, "{}", json!({"ok":true,"state":r.state}))?;
+                let mut response = json!({"ok":true,"state":r.state});
+                if let Some(entries) = requests {
+                    response["requests"] = json!(entries);
+                }
+                writeln!(stream, "{}", response)?;
                 if done {
                     if r.claimed_at.is_none()
                         && matches!(r.state.as_str(), "deferred" | "cancelled")

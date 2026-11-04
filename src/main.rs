@@ -1,4 +1,5 @@
 #![cfg(unix)]
+mod batch;
 mod chat;
 mod dashboard;
 mod fence;
@@ -72,6 +73,8 @@ enum Action {
     },
     /// Block on a socket until a job reaches a terminal state.
     Wait { id: i64 },
+    /// Read the accumulated requests associated with a chat job.
+    Requests { id: i64 },
     /// Acknowledge inspection of a failed/interrupted job.
     Resolve { id: i64 },
     /// Cancel a queued job. Running jobs cannot be cancelled.
@@ -106,6 +109,7 @@ enum Request {
         queue: Option<String>,
     },
     Snapshot,
+    Capabilities,
     Manage {
         action: management::Control,
     },
@@ -143,6 +147,8 @@ struct Job {
     pending_action: Option<String>,
     #[serde(default)]
     observation: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request_count: Option<i64>,
 }
 struct Shared {
     home: PathBuf,
@@ -213,6 +219,7 @@ fn jobs(c: &Connection) -> Result<Vec<Job>> {
             observation: observation
                 .map(|body| serde_json::from_str(&body))
                 .transpose()?,
+            request_count: None,
         })
     })
     .collect()
@@ -255,30 +262,65 @@ fn handle(r: Request, s: &Shared) -> Result<serde_json::Value> {
             {
                 bail!("callback must be an absolute existing executable path");
             }
-            c.execute(
+            if callback.is_none() {
+                if let Some(value) = batch::submit(&c, s, &queue, &key, &cwd, &command)? {
+                    return Ok(value);
+                }
+            }
+            c.execute_batch("BEGIN IMMEDIATE")?;
+            let result = (|| -> Result<serde_json::Value> {
+                if c.query_row(
+                    "SELECT COUNT(*) FROM chat_batch_requests WHERE queue=?1 AND key=?2",
+                    params![queue, key],
+                    |row| row.get::<_, i64>(0),
+                )? != 0
+                {
+                    bail!("key already belongs to an accumulated chat request");
+                }
+                c.execute(
                 "INSERT INTO queues(name) VALUES(?1) ON CONFLICT(name) DO UPDATE SET archived=0",
                 [&queue],
             )?;
-            let encoded = serde_json::to_string(&command)?;
-            // Immutable deduplication key: a retry may not silently replace a workflow.
-            c.execute("INSERT INTO jobs(queue,key,cwd,command,state,callback,callback_state,position) VALUES(?1,?2,?3,?4,'queued',?5,'none',(SELECT COALESCE(MAX(position),0)+1 FROM jobs WHERE queue=?1)) ON CONFLICT(queue,key) DO NOTHING",params![queue,key,cwd.to_str().context("non UTF-8 cwd")?,encoded,callback.as_ref().and_then(|p|p.to_str())])?;
-            let j = jobs(&c)?
-                .into_iter()
-                .find(|j| j.queue == queue && j.key == key)
-                .unwrap();
-            if j.cwd != cwd || j.command != command || j.callback != callback {
-                bail!("key already exists with different inputs; choose a new key");
+                let encoded = serde_json::to_string(&command)?;
+                // Immutable deduplication key: a retry may not silently replace a workflow.
+                c.execute("INSERT INTO jobs(queue,key,cwd,command,state,callback,callback_state,position) VALUES(?1,?2,?3,?4,'queued',?5,'none',(SELECT COALESCE(MAX(position),0)+1 FROM jobs WHERE queue=?1)) ON CONFLICT(queue,key) DO NOTHING",params![queue,key,cwd.to_str().context("non UTF-8 cwd")?,encoded,callback.as_ref().and_then(|p|p.to_str())])?;
+                let j = jobs(&c)?
+                    .into_iter()
+                    .find(|j| j.queue == queue && j.key == key)
+                    .unwrap();
+                if j.cwd != cwd || j.command != command || j.callback != callback {
+                    bail!("key already exists with different inputs; choose a new key");
+                }
+                Ok(serde_json::json!({"id":j.id,"queue":queue,"state":j.state}))
+            })();
+            match result {
+                Ok(value) => {
+                    c.execute_batch("COMMIT")?;
+                    signal(s);
+                    Ok(value)
+                }
+                Err(error) => {
+                    let _ = c.execute_batch("ROLLBACK");
+                    Err(error)
+                }
             }
-            signal(s);
-            Ok(serde_json::json!({"id":j.id,"queue":queue,"state":j.state}))
         }
         Request::Snapshot => management::snapshot(s),
+        Request::Capabilities => Ok(serde_json::json!({"chat_request_batches_v1":true})),
         Request::Manage { action } => management::apply(action, s),
         Request::Status { queue } => {
             let mut js = jobs(&c)?;
             js.retain(|j| queue.as_ref().map_or(true, |q| *q == j.queue));
             for j in &mut js {
                 j.log = s.home.join(format!("{}.log", j.id));
+                let count: i64 = c.query_row(
+                    "SELECT COUNT(*) FROM chat_batch_requests WHERE job_id=?1",
+                    [j.id],
+                    |row| row.get(0),
+                )?;
+                if count > 0 {
+                    j.request_count = Some(count);
+                }
             }
             Ok(serde_json::to_value(js)?)
         }
@@ -613,6 +655,13 @@ fn main() -> Result<()> {
         Action::Chat(action) => return chat::run(action, &home),
         Action::Management(action) => return management::run(action, &home),
         Action::Dashboard { hidden, ui } => return dashboard::launch(&home, hidden, ui),
+        Action::Requests { id } => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&batch::requests(&home, id)?)?
+            );
+            return Ok(());
+        }
         Action::Queue { queue, all, json } => return view::show(&home, queue, all, json),
         Action::Submit {
             queue,

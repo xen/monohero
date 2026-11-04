@@ -28,6 +28,10 @@ After the returned job ID, END THE TURN. Do not poll status, report percentages,
 or exchange coordinator messages. `--cwd` is optional: it captures the current
 worktree for that job, not a separate queue. Worktrees of one project use the
 same queue and different keys. Keep queued worktrees available and unchanged.
+Before claim, repeated submissions from the same exact chat to the same queue
+share the original FIFO position. Each request keeps its own key, message and
+worktree. Requests submitted after claim receive a new position; different
+queues are independent. Deferred groups remain deferred until resumed.
 
 On grant, Monohero sends a user-visible message to that exact chat through
 `codex queue`. The host resumes its existing conversation and permission/model
@@ -37,6 +41,13 @@ alone is NOT proof the chat resumed. The actual destination must first execute:
 ```sh
 monohero claim JOB_ID --thread "$CODEX_THREAD_ID"
 ```
+
+Read the `requests` array in the claim response and account for every message
+in order using its recorded worktree. If the running service predates request
+accumulation, a repeated pending submission fails explicitly until the service
+can be updated; do not create a duplicate as a workaround.
+For inspection after interruption or deferral, `monohero requests JOB_ID`
+shows the recorded requests without resubmitting or replaying them.
 
 The grant prompt includes the exact executable and arguments. If claim fails,
 STOP without performing protected work. After claim, hold the slot through all

@@ -333,6 +333,13 @@ impl Dashboard {
                     .text_color(cx.theme().muted_foreground)
                     .child(job["cwd"].as_str().unwrap_or("").to_owned()),
             );
+        if let Some(count) = job["request_count"].as_u64().filter(|count| *count > 1) {
+            content = content.child(
+                div()
+                    .text_sm()
+                    .child(format!("{count} accumulated requests")),
+            );
+        }
         if let Some(reason) = job["hold_reason"].as_str() {
             content = content.child(
                 div()
