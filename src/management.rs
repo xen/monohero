@@ -263,6 +263,7 @@ pub fn migrate(c: &Connection) -> Result<()> {
         }
     }
     c.execute_batch("UPDATE jobs SET position=id WHERE position=0; CREATE TABLE IF NOT EXISTS queues(name TEXT PRIMARY KEY,paused INTEGER NOT NULL DEFAULT 0,archived INTEGER NOT NULL DEFAULT 0,blocked_policy TEXT NOT NULL DEFAULT 'attention',unclaimed_after INTEGER NOT NULL DEFAULT 180); INSERT OR IGNORE INTO queues(name) SELECT DISTINCT queue FROM jobs;")?;
+    crate::batch::schema(c)?;
     Ok(())
 }
 pub fn thread_id(job: &Job) -> Option<String> {
@@ -313,13 +314,21 @@ pub fn snapshot(s: &Shared) -> Result<Value> {
             json!(crate::fence::has_failure(&s.home, job.id)),
         );
         object.insert("thread_id".into(), json!(thread_id(job)));
+        let request_count: i64 = c.query_row(
+            "SELECT COUNT(*) FROM chat_batch_requests WHERE job_id=?1",
+            [job.id],
+            |row| row.get(0),
+        )?;
+        if request_count > 0 {
+            object.insert("request_count".into(), json!(request_count));
+        }
         if let Some(r) = receipt(&s.home, job.id)? {
             object.insert("delivery".into(),json!({"state":r["state"],"claimed_at":r["claimed_at"],"managed":r["managed"],"error":r["error"],"app_wake":r["app_wake"]}));
         }
         visible.push(item);
     }
     Ok(
-        json!({"version":env!("CARGO_PKG_VERSION"),"queues":queues,"jobs":visible,"monitor":crate::monitor::configuration(&s.home)?}),
+        json!({"version":env!("CARGO_PKG_VERSION"),"capabilities":["chat_request_batches_v1"],"queues":queues,"jobs":visible,"monitor":crate::monitor::configuration(&s.home)?}),
     )
 }
 fn find(c: &Connection, id: i64) -> Result<Job> {
@@ -437,6 +446,7 @@ pub fn apply(action: Control, s: &Shared) -> Result<Value> {
                 bail!("only deferred or held jobs can be resumed");
             }
             let next = copy_job(&c, &s.home, &job, None)?;
+            crate::batch::requeue(&c, id, next)?;
             c.execute(
                 "UPDATE jobs SET state='requeued',archived=1 WHERE id=?1",
                 [id],
@@ -601,6 +611,11 @@ fn copy_job(c: &Connection, home: &Path, job: &Job, hold: Option<&str>) -> Resul
     let mut command = job.command.clone();
     if command.get(3).map(String::as_str) == Some("chat-worker") {
         let worker = 3;
+        if command.iter().any(|arg| arg == "--batch-requests")
+            && !command.iter().any(|arg| arg == "--goal-key")
+        {
+            command.extend(["--goal-key".into(), job.key.clone()]);
+        }
         if command.iter().any(|arg| arg == "--park-goal") {
             let thread = thread_id(job).context("goal wait lacks destination thread")?;
             let saved: Value = serde_json::from_slice(&fs::read(
@@ -637,7 +652,8 @@ fn defer_record(c: &Connection, home: &Path, job: &Job, reason: &str) -> Result<
         if job.state == "queued" {
             c.execute("UPDATE jobs SET state='queued',position=(SELECT COALESCE(MAX(position),0)+1 FROM jobs WHERE queue=?1) WHERE id=?2",params![job.queue,job.id])?;
         } else {
-            copy_job(c, home, job, Some(reason))?;
+            let next = copy_job(c, home, job, Some(reason))?;
+            crate::batch::requeue(c, job.id, next)?;
             c.execute(
                 "UPDATE jobs SET state='requeued',archived=1 WHERE id=?1",
                 [job.id],
