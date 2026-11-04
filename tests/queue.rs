@@ -119,13 +119,14 @@ fn fifo_dedup_and_independent_queues() {
     .success());
 }
 #[test]
-fn failure_barrier_cancel_and_resolution() {
+fn failed_job_does_not_block_following_jobs() {
     let s = server();
     let h = s.home.path();
     let a = submit(h, "a", "bad", "exit 7");
     assert!(!wait(h, a).status.success());
     let b = submit(h, "a", "next", "echo next");
-    assert_eq!(state(h, b), "queued");
+    assert!(wait(h, b).status.success());
+    json(h, &["pause-queue", "a"]);
     let c = submit(h, "a", "cancel", "echo never");
     json(h, &["cancel", &c.to_string()]);
     assert_eq!(state(h, c), "cancelled");
@@ -134,22 +135,43 @@ fn failure_barrier_cancel_and_resolution() {
     assert!(wait(h, b).status.success());
 }
 #[test]
+fn failed_command_waits_for_surviving_child_before_next_job() {
+    let s = server();
+    let h = s.home.path();
+    assert!(Command::new("mkfifo")
+        .arg(h.join("gate"))
+        .status()
+        .unwrap()
+        .success());
+    let a = submit(h, "a", "child", "(touch started; read x < gate) & exit 1");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !h.join("started").exists() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    let b = submit(h, "a", "next", "true");
+    assert_eq!(state(h, b), "queued");
+    fs::write(h.join("gate"), "go\n").unwrap();
+    assert!(!wait(h, a).status.success());
+    assert!(wait(h, b).status.success());
+}
+#[test]
 fn restart_retains_queue_and_dedup() {
     let mut s = server();
     let h = s.home.path();
     let a = submit(h, "a", "fail", "exit 1");
     wait(h, a);
+    json(h, &["pause-queue", "a"]);
     let b = submit(h, "a", "pending", "echo persisted");
     s.child.kill().unwrap();
     s.child.wait().unwrap();
     s.child = start(h);
-    assert_eq!(state(h, b), "queued");
     assert_eq!(b, submit(h, "a", "pending", "echo persisted"));
-    json(h, &["resolve", &a.to_string()]);
+    json(h, &["resume-queue", "a"]);
     assert!(wait(h, b).status.success());
 }
 #[test]
-fn surviving_child_prevents_restart_then_interruption_blocks_queue() {
+fn surviving_child_prevents_restart_then_queue_continues() {
     let mut s = server();
     let h = s.home.path();
     assert!(Command::new("mkfifo")
@@ -175,8 +197,6 @@ fn surviving_child_prevents_restart_then_interruption_blocks_queue() {
     thread::sleep(Duration::from_millis(100));
     s.child = start(h);
     assert_eq!(state(h, a), "interrupted");
-    assert_eq!(state(h, b), "queued");
-    json(h, &["resolve", &a.to_string()]);
     assert!(wait(h, b).status.success());
 }
 #[test]
@@ -266,11 +286,12 @@ fn worktrees_share_queue_but_keep_their_own_working_directories() {
 }
 
 #[test]
-fn readable_queue_preserves_barriers_fifo_and_project_isolation() {
+fn readable_queue_shows_failures_fifo_and_project_isolation() {
     let server = server();
     let home = server.home.path();
     let failed = submit(home, "project-a", "failed-release", "exit 9");
     assert!(!wait(home, failed).status.success());
+    json(home, &["pause-queue", "project-a"]);
     let first = submit(home, "project-a", "first-waiter", "exit 0");
     let second = submit(home, "project-a", "second-waiter", "exit 0");
     let other = submit(home, "project-b", "other-project", "exit 0");
@@ -279,7 +300,8 @@ fn readable_queue_preserves_barriers_fifo_and_project_isolation() {
     let output = cli(home, &["queue", "--queue", "project-a"]);
     assert!(output.status.success());
     let text = String::from_utf8(output.stdout).unwrap();
-    assert!(text.contains(&format!("BLOCKED by #{failed}")), "{text}");
+    assert!(text.contains(&format!("#{failed}")), "{text}");
+    assert!(text.contains("failed"), "{text}");
     assert!(text.contains("waiting 1"));
     assert!(text.contains("waiting 2"));
     assert!(text.find("first-waiter").unwrap() < text.find("second-waiter").unwrap());

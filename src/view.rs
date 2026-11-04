@@ -33,20 +33,7 @@ fn render(jobs: &[Job]) -> String {
     }
     let mut output = String::new();
     for (queue, jobs) in groups {
-        let blockers: Vec<String> = jobs
-            .iter()
-            .filter(|job| matches!(job.state.as_str(), "failed" | "interrupted"))
-            .map(|job| format!("#{}", job.id))
-            .collect();
         writeln!(output, "Queue: {queue}").unwrap();
-        if !blockers.is_empty() {
-            writeln!(
-                output,
-                "  BLOCKED by {} — inspect before resolve",
-                blockers.join(", ")
-            )
-            .unwrap();
-        }
         let mut position = 0;
         for job in jobs {
             let label = if job.state == "queued" {

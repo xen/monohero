@@ -72,7 +72,7 @@ enum Action {
     },
     /// Block on a socket until a job reaches a terminal state.
     Wait { id: i64 },
-    /// Acknowledge inspection of a failed/interrupted job; unblock its queue.
+    /// Acknowledge inspection of a failed/interrupted job.
     Resolve { id: i64 },
     /// Cancel a queued job. Running jobs cannot be cancelled.
     Cancel { id: i64 },
@@ -375,13 +375,37 @@ fn execute(id: i64, s: &Shared, guard: &File) -> Result<()> {
     {
         command.push("--managed-commands".into());
     }
-    let status = Command::new(&command[0])
-        .args(&command[1..])
+    // Managed chat workers use the same fence for their own protected commands.
+    let work = if command.get(3).map(String::as_str) == Some("chat-worker") {
+        None
+    } else {
+        Some(fence::inherited_work(&s.home, id)?)
+    };
+    use std::os::unix::process::CommandExt;
+    let mut process = Command::new(&command[0]);
+    process.args(&command[1..]);
+    if let Some(file) = &work {
+        let fd = file.as_raw_fd();
+        unsafe {
+            process.pre_exec(move || {
+                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    let status = process
         .current_dir(&j.cwd)
         .stdin(Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log.try_clone()?)
         .status();
+    drop(work);
+    // Descendants can outlive the command itself; do not grant the next job
+    // until all inherited work locks have drained.
+    let drained = fence::exclusive(&s.home, id)?;
+    drop(drained);
     let (state, code) = match status {
         Ok(v) if v.success() => ("succeeded", v.code()),
         Ok(v) => ("failed", v.code()),
@@ -401,7 +425,18 @@ fn execute(id: i64, s: &Shared, guard: &File) -> Result<()> {
     signal(s);
     if let Some(callback) = j.callback {
         c.execute("UPDATE jobs SET callback_state='running' WHERE id=?1", [id])?;
-        let result = Command::new(callback)
+        let callback_work = fence::inherited_work(&s.home, id)?;
+        let callback_fd = callback_work.as_raw_fd();
+        let mut process = Command::new(callback);
+        unsafe {
+            process.pre_exec(move || {
+                if libc::fcntl(callback_fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let result = process
             .arg(id.to_string())
             .arg(state)
             .current_dir(&j.cwd)
@@ -409,6 +444,8 @@ fn execute(id: i64, s: &Shared, guard: &File) -> Result<()> {
             .stdout(log.try_clone()?)
             .stderr(log)
             .status();
+        drop(callback_work);
+        drop(fence::exclusive(&s.home, id)?);
         let callback_state = if result.is_ok_and(|v| v.success()) {
             "succeeded"
         } else {
@@ -430,14 +467,11 @@ fn worker(queue: String, s: Arc<Shared>, guard: File) -> Result<()> {
         // One worker per queue. Transaction makes cancellation and claiming atomic.
         c.execute_batch("BEGIN IMMEDIATE")?;
         let js = jobs(&c)?;
-        let blocked = js.iter().any(|j| {
-            j.queue == queue && !j.archived && matches!(j.state.as_str(), "failed" | "interrupted")
-        });
         let paused: bool =
             c.query_row("SELECT paused FROM queues WHERE name=?1", [&queue], |r| {
                 r.get(0)
             })?;
-        let next = if blocked || paused {
+        let next = if paused {
             None
         } else {
             js.iter()

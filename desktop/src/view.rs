@@ -451,7 +451,7 @@ impl Dashboard {
                     .small()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.model.confirm(
-                            format!("Resolve failure barrier for #{id}?"),
+                            format!("Acknowledge inspection of failed job #{id}?"),
                             action.clone(),
                         );
                         cx.notify();
