@@ -751,6 +751,19 @@ fn stale_or_unknown_status_never_revokes_a_claimed_grant() {
     );
     assert_eq!(state(h, a), "running");
     assert_eq!(receipt(h, a)["state"], "claimed");
+    let mut persisted = observation("stopped");
+    persisted["authoritative"] = serde_json::json!(false);
+    persisted["source"] = serde_json::json!("codex-history");
+    persisted["turn_started_at"] = persisted["observed_at"].clone();
+    assert_eq!(
+        manage(
+            h,
+            serde_json::json!({"type":"observe","id":a,"observation":persisted})
+        )["ok"],
+        true
+    );
+    assert_eq!(state(h, a), "running");
+    assert_eq!(receipt(h, a)["state"], "claimed");
     finish(h, a);
 }
 
