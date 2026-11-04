@@ -206,7 +206,7 @@ fn transport_acceptance_alone_is_not_a_claim() {
     assert!(wait(h, a).status.success());
 }
 #[test]
-fn wrong_thread_uncertain_delivery_and_connector_errors_block_queue() {
+fn connector_errors_do_not_block_queue() {
     for mode in ["wrong", "malformed", "fail"] {
         let s = server();
         let h = s.home.path();
@@ -214,8 +214,6 @@ fn wrong_thread_uncertain_delivery_and_connector_errors_block_queue() {
         let a = enqueue(h, &codex, "p", "a", THREAD);
         assert!(!wait(h, a).status.success());
         let b = submit(h, "p", "b", "true");
-        assert_eq!(state(h, b), "queued");
-        json(h, &["resolve", &a.to_string()]);
         assert!(wait(h, b).status.success());
     }
 }
@@ -256,7 +254,7 @@ fn completed_command_wakes_owner_without_occupying_its_queue() {
     assert_eq!(receipt(h, notice)["state"], "completed");
 }
 #[test]
-fn failed_command_still_notifies_and_preserves_original_barrier() {
+fn failed_command_still_notifies_and_queue_continues() {
     let s = server();
     let h = s.home.path();
     let codex = stub(h, "auto");
@@ -277,7 +275,7 @@ fn failed_command_still_notifies_and_preserves_original_barrier() {
         .unwrap();
     assert!(wait(h, notice).status.success());
     let b = submit(h, "p", "next", "true");
-    assert_eq!(state(h, b), "queued");
+    assert!(wait(h, b).status.success());
 }
 #[test]
 fn one_thread_does_not_receive_two_simultaneous_grants() {
@@ -585,7 +583,7 @@ fn configured_native_wake_loads_destination_after_delivery_and_requires_finish()
 }
 
 #[test]
-fn failed_native_wake_preserves_accepted_message_and_failure_barrier_without_retry() {
+fn failed_native_wake_preserves_accepted_message_without_retry() {
     let s = server();
     let h = s.home.path();
     let codex = stub(h, "queued-only");
@@ -602,7 +600,7 @@ fn failed_native_wake_preserves_accepted_message_and_failure_barrier_without_ret
         .unwrap()
         .contains("wake failed after message acceptance"));
     let b = submit(h, "p", "must-wait", "true");
-    assert_eq!(state(h, b), "queued");
+    assert!(wait(h, b).status.success());
     assert_eq!(enqueue(h, &codex, "p", "failed-wake", THREAD), a);
     assert_eq!(
         fs::read_to_string(h.join("wake-calls"))
@@ -1017,7 +1015,7 @@ fn explicit_worker_adoption_preserves_queued_identity_and_submitted_arguments() 
 }
 
 #[test]
-fn missing_protected_executable_retains_failure_barrier() {
+fn missing_protected_executable_requires_owner_yield() {
     let s = server();
     let h = s.home.path();
     let codex = stub(h, "manual");
@@ -1051,8 +1049,6 @@ fn missing_protected_executable_retains_failure_barrier() {
     );
     assert!(!wait(h, a).status.success());
     let b = submit(h, "p", "next-after-missing", "true");
-    assert_eq!(state(h, b), "queued");
-    json(h, &["resolve", &a.to_string()]);
     assert!(wait(h, b).status.success());
 }
 
@@ -1176,12 +1172,13 @@ fn archived_managed_chat_drains_running_protected_work_before_next_job() {
 }
 
 #[test]
-fn archived_cancellation_never_resolves_a_failure_barrier() {
+fn archived_cancellation_keeps_failure_history() {
     let s = server();
     let h = s.home.path();
     let codex = goal_stub(h, "manual");
     let failed = submit(h, "p", "failed-barrier", "exit 1");
     assert!(!wait(h, failed).status.success());
+    json(h, &["pause-queue", "p"]);
     let archived = enqueue(h, &codex, "p", "archived-behind-failure", THREAD);
     fs::write(
         h.join("fake-archived.json"),
@@ -1196,6 +1193,7 @@ fn archived_cancellation_never_resolves_a_failure_barrier() {
     .success());
     assert_eq!(state(h, archived), "cancelled");
     assert_eq!(state(h, failed), "failed");
+    json(h, &["resume-queue", "p"]);
     let next = submit(h, "p", "after-barrier", "true");
-    assert_eq!(state(h, next), "queued");
+    assert!(wait(h, next).status.success());
 }

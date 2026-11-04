@@ -27,6 +27,11 @@ fn resource(home: &Path, id: i64) -> Result<File> {
         .mode(0o600)
         .open(directory(home)?.join(format!("{id}.lock")))?)
 }
+pub fn inherited_work(home: &Path, id: i64) -> Result<File> {
+    let file = resource(home, id)?;
+    FileExt::lock_shared(&file)?;
+    Ok(file)
+}
 pub fn stop(home: &Path, id: i64) -> Result<()> {
     let path = directory(home)?.join(format!("{id}.stopping"));
     match OpenOptions::new()

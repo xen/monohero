@@ -147,7 +147,7 @@ existing destination chat after accepted delivery, without another message.
 This can bring the app forward. There is no automatic retry, alternate session
 or bypass of claim/finish. Verify actual destination claim on the installed
 host; opening a URL is not evidence of task execution. Opener failure records
-the already accepted message and leaves an explicit failed-job barrier. Queued
+the already accepted message as a failed job without retrying it. Later jobs can proceed. Queued
 workers using the updated CLI read the shared setting when they dispatch;
 currently running workers remain unchanged.
 

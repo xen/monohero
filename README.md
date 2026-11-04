@@ -51,13 +51,11 @@ Install `monohero-ui` beside the CLI to omit `--ui`. Both use the same `--home`.
 Use `./scripts/bundle-macos.sh` to create `dist/Monohero.app`; this is an ad-hoc
 signed local bundle, not an Apple-notarized distribution.
 
-The dashboard shows independent project queues, chat observations, failure
-barriers and work directories. Move waiting jobs up/down, pause admission, resume
+The dashboard shows independent project queues, chat observations, failed jobs and work directories. Move waiting jobs up/down, pause admission, resume
 deferred jobs at the tail, cancel pending work, clear history or delete queues.
 Destructive actions require confirmation. Clearing keeps durable job keys and
 audit records, preventing an old submission from running again accidentally.
-Running command workflows cannot be force-cancelled. Failed/interrupted effects
-must be inspected before acknowledging their barrier.
+Running command workflows cannot be force-cancelled. Failed and interrupted jobs remain visible for inspection.
 
 ### Blocked chats and monitoring
 
@@ -80,7 +78,7 @@ When monitoring confirms that a Codex chat is archived, Monohero cancels its
 waiting and deferred jobs. For a running managed grant, cancellation first drains
 protected commands; legacy claimed work still requires its owner's explicit yield.
 If the archive list is unavailable, no chat is inferred to be archived. Worktrees,
-job records and failure barriers are retained.
+job records and failure details are retained.
 
 New chat grants require protected commands to run through
 `monohero run JOB_ID --thread CHAT_UUID -- COMMAND ARGS`. Deferral first stops new
@@ -160,8 +158,7 @@ monohero cancel 3   # queued jobs only
 monohero resolve 2  # after inspecting a failed/interrupted job
 ```
 
-Failed and interrupted jobs block their queue. `resolve` acknowledges inspection,
-retains the log and exit code, and lets later jobs proceed. It never retries.
+Failed and interrupted jobs remain in history and do not block later jobs. `resolve` acknowledges inspection and retains the log and exit code. It never retries.
 Unknown IDs and invalid transitions are explicit errors. There is no force-unlock.
 
 Command mode runs executable workflows. For existing Codex conversations, use the
@@ -209,7 +206,7 @@ cargo build --release --locked
 ```
 
 Black-box tests cover FIFO, parallel queues, deduplication, blocking wait,
-failure barriers, cancellation, persistence, surviving children and callbacks.
+failure handling, cancellation, persistence, surviving children and callbacks.
 See [the design](docs/specs/2026-11-02-monohero.md). MIT licensed.
 
 ## Resume an existing Codex chat (0.2)
@@ -274,7 +271,7 @@ monohero queue --all                      # include completed history
 monohero queue --queue my-project-release --json
 ```
 
-The readable snapshot shows the current job, waiting positions, failure barriers,
+The readable snapshot shows the current job, waiting positions, failures,
 worktree directories and destination chat IDs. Positions are per queue; different
 projects remain independent. Failed/interrupted jobs explicitly show why a queue
 cannot advance. Viewing never claims, resolves or retries a job. It reads once
