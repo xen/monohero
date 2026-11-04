@@ -49,9 +49,11 @@ monohero finish JOB_ID --thread "$CODEX_THREAD_ID"
 
 On failure/blocker append `--failed` and explain. Do not finish merely to
 acknowledge the grant. Do not enqueue recursively into your own queue. Do no
-protected work after finish; only the final user report remains. The worker
-holds the slot until explicit matching finish. No timer expires it behind the
-chat's back. Monohero serializes its grants to the same thread across queues.
+protected work after finish; only the final user report remains. A claimed slot
+requires explicit matching finish, unless a managed grant is safely revoked as
+described below. Monitoring can defer an invitation that remains unclaimed past
+the configured grace period. Monohero serializes its grants to the same thread
+across queues.
 
 ## Existing goals while waiting
 
@@ -110,16 +112,17 @@ project queue. Observers never occupy the release queue they wait on.
 
 `monohero status --queue NAME` reads one snapshot. Private ID.log files contain
 execution logs. HOME/chats/JOB_ID.json records message_queued, claimed and completed
-separately, with message ID and timestamps. A chat that never claims its grant
-keeps the slot; a notice that is never acknowledged remains pending. Verify a
+separately, with message ID and timestamps. With monitoring enabled, an unclaimed
+invitation can be deferred after its configured grace period; a notice that is
+never acknowledged remains pending. Verify a
 real idle-chat wakeup when installing on a new Codex host. Never label an accepted
 CLI message as confirmed resumption. Unsupported hosts fail or remain visibly
 unacknowledged; no silent replacement session or alternate transport is used.
 
-Failed/interrupted jobs stop their queue. Inspect external effects, the owner's
-actual chat and surviving processes before `monohero resolve JOB_ID`. Resolve
-acknowledges inspection, never retries. New work gets a new key and joins the
-tail. `monohero cancel JOB_ID` cancels queued jobs only. Never retry uncertain
+Failed/interrupted jobs remain visible but do not stop their queue. Inspect
+external effects, the owner's actual chat and surviving processes before any
+follow-up. `monohero resolve JOB_ID` records inspection, never retries. New work
+gets a new key and joins the tail. `monohero cancel JOB_ID` cancels queued jobs only. Never retry uncertain
 message delivery blindly. Choose an explicit CLI with `--codex /absolute/path`.
 
 ## Claude Code and limits
